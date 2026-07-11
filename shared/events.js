@@ -58,6 +58,9 @@ const EVENTS = {
   // ══════════════════════════════════════════════
   // 발표 환경설정 & 시작/종료
   // ══════════════════════════════════════════════
+  
+  ROOM_SETTINGS_UPDATE: 'room:settings_update', // [추가] 앱 -> 서버: 발표 시작 전 설정 수시 변경 (익명/기명, 질문타이밍, 시간)
+  ROOM_SETTINGS_UPDATED: 'room:settings_updated', // [추가] 서버 -> 전체: 변경된 설정 브로드캐스트
 
   // 현재 발표자 앱 → 서버: 발표 시작 (환경설정값 포함 — 별도 설정 이벤트 없이 시작 시점에 한번에 전송)
   PRESENTATION_START: 'presentation:start',
@@ -125,11 +128,17 @@ const EVENTS = {
 
 
   // ══════════════════════════════════════════════
-  // 파일 업로드
+  // 파일 업로드 & AI 노트 시스템
   // ══════════════════════════════════════════════
 
   FILE_READY: 'file:ready',
   // payload: { fileId: string, ownerId: string, slideCount: number }
+  SCRIPT_READY: 'script:ready',               // [추가] 앱 -> 서버: 대본 파일(또는 텍스트) 업로드 완료
+
+  AI_GENERATE_REQUEST: 'ai:generate_request', // [추가] 앱 -> 서버: AI 요약 버튼 클릭 (대본 유무 상태 포함)
+  AI_GENERATE_COMPLETE: 'ai:generate_complete', // [추가] 서버 -> 앱: AI 요약 완료 (슬라이드별 노트 배열 반환)
+  
+  SLIDE_NOTE_UPDATE: 'slide:note_update',     // [추가] 앱 -> 서버: 발표자가 슬라이드 노트를 직접 수동으로 수정함
 
 
   // ══════════════════════════════════════════════
