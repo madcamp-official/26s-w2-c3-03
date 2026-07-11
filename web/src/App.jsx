@@ -7,7 +7,6 @@ const socket = io(`http://${window.location.hostname}:4000`);
 
 // =========================================================================
 // [나중에 삭제할 임시 코드 START]
-// 팀원 A의 모바일 앱(방 생성 기능)이 연동되면 아래 HomeView 컴포넌트 전체를 삭제하세요!
 // =========================================================================
 const HomeView = () => {
   const [testRoomInfo, setTestRoomInfo] = useState(null);
@@ -34,9 +33,10 @@ const HomeView = () => {
         </button>
         
         {testRoomInfo && (
-          <div style={{ marginTop: '20px', fontSize: '18px', backgroundColor: '#f8f9fa', padding: '15px', borderRadius: '8px' }}>
-            <p><strong>🖥️ 디스플레이 코드:</strong> <span style={{ color: '#d63031' }}>{testRoomInfo.displayCode}</span></p>
-            <p><strong>📱 청중 코드:</strong> <span style={{ color: '#d63031' }}>{testRoomInfo.audienceCode}</span></p>
+          <div style={{ marginTop: '20px', fontSize: '18px', backgroundColor: '#f8f9fa', padding: '15px', borderRadius: '8px', textAlign: 'left' }}>
+            <p><strong>👑 발표자 코드 (앱용):</strong> <span style={{ color: '#0984e3' }}>{testRoomInfo.presenterCode}</span></p>
+            <p><strong>🖥️ 디스플레이 코드 (PC용):</strong> <span style={{ color: '#d63031' }}>{testRoomInfo.displayCode}</span></p>
+            <p><strong>📱 청중 코드 (모바일용):</strong> <span style={{ color: '#00b894' }}>{testRoomInfo.audienceCode}</span></p>
           </div>
         )}
       </div>
@@ -56,7 +56,6 @@ const HomeView = () => {
 // [나중에 삭제할 임시 코드 END]
 // =========================================================================
 
-
 // PC 디스플레이 화면 (/display)
 const DisplayView = () => {
   const [code, setCode] = useState('');
@@ -67,6 +66,7 @@ const DisplayView = () => {
   };
 
   useEffect(() => {
+    // 백엔드에서 전달받은 audienceCode를 이용해 QR 렌더링
     socket.on('room:joined', (data) => setJoinedData(data));
     return () => socket.off('room:joined');
   }, []);
@@ -109,7 +109,7 @@ const AudienceView = () => {
   
   const [code, setCode] = useState(initialCode);
   const [nickname, setNickname] = useState('');
-  const [joined, setJoined] = useState(false);
+  const [joinedData, setJoinedData] = useState(null);
   const [audienceCount, setAudienceCount] = useState(0);
 
   const handleJoin = () => {
@@ -117,7 +117,7 @@ const AudienceView = () => {
   };
 
   useEffect(() => {
-    socket.on('room:joined', () => setJoined(true));
+    socket.on('room:joined', (data) => setJoinedData(data)); // 서버가 확정한 닉네임 받기
     socket.on('room:audience_count', (data) => setAudienceCount(data.count)); 
     
     return () => {
@@ -126,7 +126,16 @@ const AudienceView = () => {
     };
   }, []);
 
-  if (joined) return <h2 style={{ textAlign: 'center', marginTop: '50px' }}>입장 완료! 현재 청중: {audienceCount}명</h2>;
+  if (joinedData) {
+    return (
+      <div style={{ textAlign: 'center', marginTop: '50px' }}>
+        <h2>입장 완료!</h2>
+        {/* 서버가 익명으로 자동 생성해준 닉네임을 화면에 표시 */}
+        <h3>내 닉네임: <span style={{ color: '#00b894' }}>{joinedData.nickname}</span></h3>
+        <p>현재 청중: {audienceCount}명</p>
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: '20px', textAlign: 'center' }}>
@@ -138,7 +147,7 @@ const AudienceView = () => {
           style={{ padding: '10px', width: '200px' }}
         />
         <input 
-          placeholder="닉네임 (익명 설정 시 미입력)" 
+          placeholder="닉네임 (비워두면 자동 생성)" 
           value={nickname} onChange={(e) => setNickname(e.target.value)} 
           style={{ padding: '10px', width: '200px' }}
         />
@@ -154,9 +163,7 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* [나중에 삭제할 라우터 START] */}
         <Route path="/" element={<HomeView />} />
-        {/* [나중에 삭제할 라우터 END] */}
         <Route path="/display" element={<DisplayView />} />
         <Route path="/audience" element={<AudienceView />} />
       </Routes>
