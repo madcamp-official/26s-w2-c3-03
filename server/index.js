@@ -18,6 +18,8 @@ const io = new Server(server, {
 // 랜덤 방 코드 6자리 생성 함수
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
+const roomTimers = {}; // 방마다 타이머(setInterval)를 저장할 공간
+
 // =========================================================================
 // [REST API 구역] 파일 업로드, AI 처리, 대본 수정 등 실시간성이 없는 무거운 작업
 // =========================================================================
@@ -28,7 +30,7 @@ app.post('/rooms/:roomId/script', (req, res) => {
   // TODO: 파일 저장 및 텍스트 추출 후 슬라이드 개수에 맞게 분할하여 DB(slides) 저장
   // (임시 목업 응답)
   const mockNotes = [{ slideIndex: 1, text: '자동 분할된 첫 번째 슬라이드 대본입니다.' }];
-  
+
   // 처리가 끝나면 소켓으로 앱에 "준비 완료" 알림만 가볍게 쏴줌
   io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: mockNotes, source: 'auto_split' });
   res.json({ success: true, message: '대본 업로드 및 분할 완료' });
@@ -40,7 +42,7 @@ app.post('/rooms/:roomId/slides/note/ai', (req, res) => {
   const { hasScript } = req.body;
   // TODO: Gemini API 태우고 DB 업데이트 로직
   const mockNotes = [{ slideIndex: 1, text: 'AI가 요약한 핵심 키워드 1, 2, 3' }];
-  
+
   io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: mockNotes, source: hasScript ? 'ai_summarize' : 'ai_generate' });
   res.json({ success: true, message: 'AI 처리 완료' });
 });
@@ -49,10 +51,10 @@ app.post('/rooms/:roomId/slides/note/ai', (req, res) => {
 app.put('/rooms/:roomId/slides/:slideIndex/note', (req, res) => {
   const { roomId, slideIndex } = req.params;
   const { newNote, editedByName } = req.body;
-  
+
   db.prepare('UPDATE slides SET ai_summary_note = ? WHERE room_id = ? AND slide_index = ?')
     .run(newNote, roomId, slideIndex);
-    
+
   // 다른 공동 발표자들의 화면에도 수정되었다는 알림(토스트)을 띄우기 위해 브로드캐스트
   io.to(roomId).emit(EVENTS.NOTE_SAVED, { slideIndex: parseInt(slideIndex, 10), editedByName });
   res.json({ success: true });
@@ -81,6 +83,12 @@ io.on('connection', (socket) => {
       VALUES (?, ?, ?, ?, ?, ?, 'wait')
     `);
     stmt.run(roomId, socket.id, socket.id, presenterCode, displayCode, audienceCode);
+
+    // [FIX 3] 방장도 users 테이블에 등록해야 발표 종료 시 발표자 수 집계에 포함됨
+    // (기존 코드는 rooms.current_presenter_id만 채우고 users에는 아무도 안 넣어서
+    //  공동 발표자가 없으면 total_presenters가 0으로 기록되는 버그가 있었음)
+    db.prepare('INSERT OR REPLACE INTO users (user_id, room_id, role, nickname) VALUES (?, ?, ?, ?)')
+      .run(socket.id, roomId, 'host', null);
 
     socket.join(roomId);
     socket.emit(EVENTS.ROOM_CREATED, { roomId, displayCode, audienceCode, presenterCode });
@@ -120,7 +128,7 @@ io.on('connection', (socket) => {
     const roomId = room.room_id;
     let finalNickname = nickname;
 
-    // ✨ 기획 반영: 익명 모드이거나 이름을 안 보냈으면 자동 생성
+    // 기획 반영: 익명 모드이거나 이름을 안 보냈으면 자동 생성
     if (room.question_identity_mode === 'anonymous' || !finalNickname) {
       finalNickname = `익명_${Math.floor(Math.random() * 9000) + 1000}`;
     }
@@ -130,7 +138,7 @@ io.on('connection', (socket) => {
 
     socket.join(roomId);
 
-    // ✨ 기획 반영: 확정된 닉네임을 청중에게 다시 내려줌
+    // 기획 반영: 확정된 닉네임을 청중에게 다시 내려줌
     socket.emit(EVENTS.ROOM_JOINED, {
       roomId, role: 'audience', userId: socket.id, nickname: finalNickname, currentFileUrl: room.file_url || null
     });
@@ -158,12 +166,38 @@ io.on('connection', (socket) => {
 
     // 설정 최종 고정 및 진행 상태로 변경
     const startedAt = Date.now();
+    // [FIX 1] durationSeconds가 어디서도 선언되지 않아 아래 setInterval 콜백에서
+    // ReferenceError로 서버 전체가 죽던 버그. payload.durationMinutes 기준으로 계산해서 추가.
+    const durationSeconds = payload.durationMinutes * 60;
+
     db.prepare(`UPDATE rooms SET duration_minutes = ?, question_identity_mode = ?, question_timing_mode = ?, status = 'progress', started_at = ? WHERE room_id = ?`)
       .run(payload.durationMinutes, payload.questionIdentityMode, payload.questionTimingMode, startedAt, room.room_id);
 
     io.to(room.room_id).emit(EVENTS.PRESENTATION_STARTED, {
       startedAt, ...payload, currentFileUrl: room.file_url
     });
+
+    if (roomTimers[room.room_id]) clearInterval(roomTimers[room.room_id]); // 기존 타이머가 있으면 초기화
+
+    io.to(room.room_id).emit(EVENTS.TIMER_UPDATE, {
+      elapsedSeconds: 0,
+      durationSeconds: durationSeconds,
+      isOvertime: false
+    });
+
+    // 그 다음부터 1초마다 쏴주기
+    roomTimers[room.room_id] = setInterval(() => {
+      const now = Date.now();
+      const elapsedSeconds = Math.floor((now - startedAt) / 1000);
+      const isOvertime = elapsedSeconds >= durationSeconds;
+
+      // 1초마다 방 안의 모두에게 남은 시간 쏴주기 (오버타임이어도 멈추지 않고 계속 흘러감)
+      io.to(room.room_id).emit(EVENTS.TIMER_UPDATE, {
+        elapsedSeconds,
+        durationSeconds,
+        isOvertime
+      });
+    }, 1000);
   });
 
   socket.on(EVENTS.PRESENTATION_END, () => {
@@ -172,19 +206,42 @@ io.on('connection', (socket) => {
 
     const endTime = Date.now();
     const totalElapsedSeconds = Math.floor((endTime - room.started_at) / 1000);
-    
-    // ✨ 기획 반영: 종료 시점의 발표자 수, 청중 수를 계산해서 방 기록에 영구 보존
-    const presenterCount = db.prepare("SELECT COUNT(*) as c FROM users WHERE room_id = ? AND role = 'presenter'").get(room.room_id).c;
+
+    // [FIX 3] 방장(host)도 이제 users에 들어있으므로 presenterCount에 'host'도 포함해야
+    // 공동 발표자 없이 혼자 발표한 경우에도 총 발표자 수가 0이 아니라 1로 정확히 집계됨
+    const presenterCount = db.prepare("SELECT COUNT(*) as c FROM users WHERE room_id = ? AND role IN ('host', 'presenter')").get(room.room_id).c;
     const audienceCount = db.prepare("SELECT COUNT(*) as c FROM users WHERE room_id = ? AND role = 'audience'").get(room.room_id).c;
 
     db.prepare(`UPDATE rooms SET status = 'end', ended_at = ?, total_time_seconds = ?, total_presenters = ?, total_audience = ? WHERE room_id = ?`)
       .run(endTime, totalElapsedSeconds, presenterCount, audienceCount, room.room_id);
 
     io.to(room.room_id).emit(EVENTS.PRESENTATION_ENDED, { totalElapsedSeconds, presenterCount, audienceCount });
+
+    if (roomTimers[room.room_id]) {
+      clearInterval(roomTimers[room.room_id]);
+      delete roomTimers[room.room_id];
+    }
   });
 
   // ----------------------------------------------------
-  // [3] Q&A 시스템
+  // [3] 슬라이드 제어 (권한 검증 포함)
+  // ----------------------------------------------------
+  // [FIX 2] 기존에는 이 두 핸들러가 PRESENTATION_START 콜백 안쪽에 중첩되어 있어서,
+  // presentation:start가 두 번 호출되면(재접속/중복 클릭 등) 리스너가 계속 누적 등록되고
+  // slide:next 한 번에 slide:changed가 여러 번 나가는 버그가 있었음.
+  // connection 스코프 최상단으로 옮겨서 소켓당 딱 한 번만 등록되도록 수정.
+  socket.on(EVENTS.SLIDE_NEXT, () => {
+    const room = db.prepare('SELECT room_id FROM rooms WHERE current_presenter_id = ?').get(socket.id);
+    if (room) io.to(room.room_id).emit(EVENTS.SLIDE_CHANGED, { direction: 'next' });
+  });
+
+  socket.on(EVENTS.SLIDE_PREV, () => {
+    const room = db.prepare('SELECT room_id FROM rooms WHERE current_presenter_id = ?').get(socket.id);
+    if (room) io.to(room.room_id).emit(EVENTS.SLIDE_CHANGED, { direction: 'prev' });
+  });
+
+  // ----------------------------------------------------
+  // [4] Q&A 시스템
   // ----------------------------------------------------
   socket.on(EVENTS.QUESTION_SUBMIT, ({ text, category }) => {
     const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(socket.id);
@@ -206,9 +263,9 @@ io.on('connection', (socket) => {
     // 선택된 시간(selected_at)을 기록하여 이 값을 기준으로 내림차순 정렬할 수 있게 함
     db.prepare('UPDATE questions SET is_selected = 1, selected_at = ? WHERE question_id = ?').run(Date.now(), questionId);
 
-    // ✨ 기획 반영: 이 방에서 채택된 모든 질문을 최신순(내림차순)으로 긁어오기
+    // 기획 반영: 이 방에서 채택된 모든 질문을 최신순(내림차순)으로 긁어오기
     const answered = db.prepare(`
-      SELECT question_id as questionId, content as text, author_name as nickname, selected_at as answeredAt 
+      SELECT question_id as questionId, content as text, author_name as nickname, selected_at as answeredAt
       FROM questions WHERE room_id = ? AND is_selected = 1 ORDER BY selected_at DESC
     `).all(user.room_id);
 
@@ -217,7 +274,7 @@ io.on('connection', (socket) => {
   });
 
   // ----------------------------------------------------
-  // [4] 연결 종료 처리
+  // [5] 연결 종료 처리
   // ----------------------------------------------------
   socket.on('disconnect', () => {
     console.log(`연결 끊김: ${socket.id}`);
