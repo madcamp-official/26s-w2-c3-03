@@ -1,8 +1,11 @@
 // server/index.js
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { jsonrepair } = require('jsonrepair');
 
 const { EVENTS } = require('../shared/events.js');
 const db = require('./database.js');
@@ -13,33 +16,326 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST", "PUT"] }
+  cors: { origin: "*", methods: ["GET", "POST", "PUT"] },
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    skipMiddlewares: true,
+  }
 });
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-const generateUserId = () => 'usr_' + Math.random().toString(36).substring(2, 10); //  고정 user_id 발급기
+const generateUserId = () => 'usr_' + Math.random().toString(36).substring(2, 10);
 
 const roomTimers = {}; 
 const roomSlides = {};
+
+const multer = require('multer');
+const fs = require('fs');
+const pdfParse = require('pdf-parse');
+const upload = multer({ dest: 'uploads/' });
+
+const mammoth = require('mammoth');
+const path = require('path');
+
+// =========================================================================
+// [AI 헬퍼 함수 구역] - 재시도 로직, 방어 로직 추가
+// =========================================================================
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function callAiApiWithRetry(prompt, options = {}) {
+  const {
+    isJsonExpected = false, 
+    maxRetries = 2,
+    pdfBase64 = null,
+    jsonSchema = null
+  } = options;
+
+  const modelConfig = { model: "gemini-3.1-flash-lite" };
+  if (isJsonExpected) {
+    modelConfig.generationConfig = {
+      responseMimeType: "application/json",
+      maxOutputTokens: 65536,
+      ...(jsonSchema && { responseSchema: jsonSchema })
+    };
+  }
+  const model = genAI.getGenerativeModel(modelConfig);
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      let result;
+      if (pdfBase64) {
+        result = await model.generateContent([
+          { inlineData: { data: pdfBase64, mimeType: "application/pdf" } },
+          prompt
+        ]);
+      } else {
+        result = await model.generateContent(prompt);
+      }
+
+      const responseText = result.response.text();
+
+      if (isJsonExpected) {
+        try {
+          let cleanJsonStr = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+          const jsonMatch = cleanJsonStr.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            cleanJsonStr = jsonMatch[0];
+          }
+
+          // ✨ 이스케이프 안 된 따옴표(대본 인용구), raw 줄바꿈, 응답 잘림(MAX_TOKENS)까지
+          // 규칙 기반으로 복구. 직접 정규식으로 짜면 놓치는 케이스가 많아 라이브러리로 위임.
+          const parsed = JSON.parse(jsonrepair(cleanJsonStr));
+
+          // ✨ 형태 검증: 이상하면 throw → 바깥 catch가 잡아서 재시도
+          if (!Array.isArray(parsed) || parsed.some(n => typeof n.slideIndex !== 'number' || typeof n.text !== 'string')) {
+            throw new Error('JSON 형태가 기대와 다릅니다 (slideIndex/text 누락).');
+          }
+
+          return parsed;
+
+        } catch (parseError) {
+          // ✨ finishReason 확인: MAX_TOKENS면 응답이 잘린 것
+          console.error(`\n🚨 [DEBUG] finishReason: ${result.response.candidates?.[0]?.finishReason}`);
+          console.error(`🚨 [DEBUG: JSON 파싱 에러] AI가 뱉은 원본 응답 텍스트:\n${responseText}\n`);
+          throw new Error(`JSON 파싱 실패: ${parseError.message}`);
+        }
+      }
+      return responseText;
+
+    } catch (error) {
+      console.error(`[AI 호출 시도 ${attempt} 실패]:`, error.message);
+      
+      if (attempt > maxRetries) {
+        throw new Error(`AI 처리 최종 실패 (총 ${attempt}회 시도): ${error.message}`);
+      }
+      
+      const waitTime = Math.pow(2, attempt - 1) * 1000;
+      console.log(`일시적 오류 발생. ${waitTime}ms 후 재시도합니다...`);
+      await delay(waitTime);
+    }
+  }
+}
 
 // =========================================================================
 // [REST API 구역]
 // =========================================================================
 
-app.post('/rooms/:roomId/script', (req, res) => {
+// 1. 발표 자료(PDF) 단독 업로드 API
+app.post('/rooms/:roomId/presentation', upload.single('presentationFile'), async (req, res) => {
   const { roomId } = req.params;
-  const mockNotes = [{ slideIndex: 1, text: '자동 분할된 첫 번째 슬라이드 대본입니다.' }];
-  io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: mockNotes, source: 'auto_split' });
-  res.json({ success: true, message: '대본 업로드 및 분할 완료' });
+  const savedPdfPath = `uploads/${roomId}_presentation.pdf`;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: '발표 자료(PDF)는 필수입니다.' });
+    }
+
+    // 나중에 대본 분석을 위해 PDF 파일을 방(Room) 고유 이름으로 저장해둠
+    fs.renameSync(req.file.path, savedPdfPath);
+
+    const pdfBase64 = fs.readFileSync(savedPdfPath).toString("base64");
+
+    const prompt = `첨부된 PDF 문서의 전체 페이지(슬라이드) 수가 총 몇 장인지 숫자만 대답해 주세요. 예: 15`;
+    const countText = await callAiApiWithRetry(prompt, { isJsonExpected: false, pdfBase64 });
+    const slideCount = parseInt(countText.trim(), 10);
+
+    console.log(`[DEBUG: /presentation] ✅ Gemini 파악 완료 -> 총 ${slideCount}장!`);
+
+    if (isNaN(slideCount) || slideCount <= 0) {
+      throw new Error('슬라이드 수를 파악할 수 없습니다.');
+    }
+
+    const stmt = db.prepare('INSERT OR REPLACE INTO slides (slide_id, room_id, slide_index, original_note) VALUES (?, ?, ?, ?)');
+    
+    const insertNotes = db.transaction(() => {
+      for (let i = 1; i <= slideCount; i++) {
+        const slideId = `${roomId}_${i}`;
+        stmt.run(slideId, roomId, i, ''); // 대본은 빈 칸으로 자리만 만들어 둠
+      }
+    });
+    insertNotes();
+
+    // ✨ [핵심 수정] 빈 대본 정보를 프론트에 소켓으로 쏘지 않도록 EVENTS.NOTES_READY 방출 줄 삭제!
+    // 프론트엔드는 아래 HTTP 응답만 받고 완료 처리를 진행하도록 유도합니다.
+    const responsePayload = { success: true, message: '발표 자료 분석 완료', slideCount: slideCount, hasScript: true };
+    res.json(responsePayload);
+    console.log(`[DEBUG: /presentation] 📤 프론트엔드로 응답 전송:`, responsePayload);
+
+  } catch (error) {
+    console.error('발표 자료 처리 중 에러:', error);
+    if (fs.existsSync(savedPdfPath)) fs.unlinkSync(savedPdfPath);
+    res.status(500).json({ success: false, message: '발표 자료를 분석하는 중 에러가 발생했습니다.' });
+  }
 });
 
-app.post('/rooms/:roomId/slides/note/ai', (req, res) => {
+
+// 2. 대본 단독 업로드 API
+app.post('/rooms/:roomId/script', upload.single('scriptFile'), async (req, res) => {
   const { roomId } = req.params;
-  const { hasScript } = req.body;
-  const mockNotes = [{ slideIndex: 1, text: 'AI가 요약한 핵심 키워드 1, 2, 3' }];
-  io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: mockNotes, source: hasScript ? 'ai_summarize' : 'ai_generate' });
-  res.json({ success: true, message: 'AI 처리 완료' });
+  const savedPdfPath = `uploads/${roomId}_presentation.pdf`;
+  const scriptFilePath = req.file ? req.file.path : null;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: '대본 파일이 필요합니다.' });
+    }
+
+    if (!fs.existsSync(savedPdfPath)) {
+      return res.status(400).json({ success: false, message: '발표 자료(PDF)를 먼저 업로드해야 합니다.' });
+    }
+
+    // ✨ [핵심 1] DB에서 해당 방(roomId)에 생성된 슬라이드 개수를 직접 세어옵니다.
+    const countRow = db.prepare('SELECT COUNT(*) as count FROM slides WHERE room_id = ?').get(roomId);
+    const slideCount = countRow.count;
+
+    if (slideCount === 0) {
+      return res.status(400).json({ success: false, message: 'DB에 슬라이드 정보가 없습니다. 발표 자료를 다시 업로드해 주세요.' });
+    }
+
+    const pdfBase64 = fs.readFileSync(savedPdfPath).toString("base64");
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    let fullScript = '';
+
+    if (ext === '.docx') {
+      const result = await mammoth.extractRawText({ path: scriptFilePath });
+      fullScript = result.value;
+    } else if (ext === '.txt') {
+      fullScript = fs.readFileSync(scriptFilePath, 'utf-8');
+    } else {
+      return res.status(400).json({ success: false, message: '지원하지 않는 대본 파일 형식입니다. (DOCX, TXT만 가능)' });
+    }
+
+    console.log(`[DEBUG: /script] 📝 텍스트 추출 완료! (총 글자 수: ${fullScript.length}자)`);
+
+    if (!fullScript || fullScript.trim() === '') {
+      return res.status(400).json({ success: false, message: '대본 파일에서 텍스트를 추출할 수 없습니다.' });
+    }
+    
+    // ✨ [핵심 2] 방금 구한 slideCount를 프롬프트에 주입하여 AI의 분할 정확도를 극대화합니다!
+    const prompt = `당신은 발표 자료와 대본을 매칭하는 전문 어시스턴트입니다.
+
+    아래는 발표 대본 전문입니다. 첨부된 PDF는 이 발표에서 사용할 슬라이드 자료이며, 총 ${slideCount}장입니다.
+
+    당신의 임무: 대본 전체를 처음부터 끝까지 하나도 빠짐없이, 각 슬라이드의 내용과 논리적으로 대응되도록 ${slideCount}개 구간으로 나누세요.
+
+    규칙:
+    - 반드시 정확히 ${slideCount}개 항목을 출력하세요 (slideIndex 1부터 ${slideCount}까지 빠짐없이).
+    - 각 슬라이드에 대응하는 대본이 명확하지 않으면, 앞뒤 문맥상 가장 자연스러운 위치에 배치하세요.
+    - 대본 원문의 표현을 최대한 그대로 유지하고, 임의로 요약하거나 새로운 내용을 추가하지 마세요.
+    - 한 슬라이드에 배정할 내용이 전혀 없다면 text를 빈 문자열로 두세요.
+
+    출력 형식:
+    - 반드시 아래 형식의 JSON 배열만 출력하세요. 다른 설명, 인사말, 마크다운 코드블록은 절대 포함하지 마세요.
+    - 각 항목은 { "slideIndex": 숫자, "text": "해당 구간 대본" } 형태입니다.
+
+    예시:
+    [
+      { "slideIndex": 1, "text": "안녕하세요, 오늘 발표를 시작하겠습니다..." },
+      { "slideIndex": 2, "text": "먼저 프로젝트 배경을 말씀드리면..." }
+    ]
+
+    [대본 전문]
+    ${fullScript}`;
+
+    // ✨ Gemini에게 강제할 응답 스키마
+    const slideNotesSchema = {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          slideIndex: { type: "integer" },
+          text: { type: "string" }
+        },
+        required: ["slideIndex", "text"]
+      }
+    };
+
+    const slideNotes = await callAiApiWithRetry(prompt, { 
+      isJsonExpected: true, 
+      pdfBase64, 
+      jsonSchema: slideNotesSchema 
+    });
+    console.log(`[DEBUG: /script] ✅ Gemini 매칭 완료! 반환된 배열 길이: ${slideNotes.length}`);
+
+    // ✨ [핵심 3] INSERT OR REPLACE 대신 UPDATE를 사용하여 기존에 만들어둔 빈 방에 텍스트만 덮어씌웁니다.
+    const stmt = db.prepare('UPDATE slides SET original_note = ? WHERE room_id = ? AND slide_index = ?');
+    const updateNotes = db.transaction(() => {
+      for (const note of slideNotes) {
+        stmt.run(note.text, roomId, note.slideIndex);
+      }
+    });
+    updateNotes();
+    console.log(`[DEBUG: /script] 💾 DB 대본 UPDATE 완료`);
+
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes, source: 'ai_context_split' });
+    console.log(`[DEBUG: /script] 📡 프론트엔드로 소켓 이벤트(NOTES_READY) 방출 완료`);
+    
+    // ✨ [핵심 4] DB에서 가져온 정확한 slideCount를 프론트엔드에 응답합니다.
+    // slideNotes도 같이 실어서, 소켓 재연결로 NOTES_READY를 놓쳐도 REST 응답만으로 화면을 갱신할 수 있게 함.
+    const responsePayload = { success: true, message: '대본 AI 매칭 완료', slideCount: slideCount, hasScript: true, slideNotes }
+    res.json(responsePayload);
+    console.log(`[DEBUG: /script] 📤 프론트엔드로 응답 전송:`, responsePayload);
+
+  } catch (error) {
+    console.error('대본 처리 중 에러:', error);
+    res.status(500).json({ success: false, message: '대본을 분석하는 중 에러가 발생했습니다.' });
+  } finally {
+    if (scriptFilePath && fs.existsSync(scriptFilePath)) {
+      fs.unlinkSync(scriptFilePath); 
+    }
+    if (fs.existsSync(savedPdfPath)) {
+      fs.unlinkSync(savedPdfPath);   
+    }
+  }
 });
+
+
+// 3. AI 노트 요약/생성 API
+app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
+  const { roomId } = req.params;
+  const { hasScript } = req.body; 
+
+  try {
+    const slides = db.prepare('SELECT * FROM slides WHERE room_id = ? ORDER BY slide_index ASC').all(roomId);
+    
+    if (slides.length === 0) {
+      return res.status(404).json({ success: false, message: '처리할 슬라이드/대본 데이터가 없습니다.' });
+    }
+
+    const updateStmt = db.prepare('UPDATE slides SET ai_summary_note = ? WHERE slide_id = ?');
+
+    const aiPromises = slides.map(async (slide) => {
+      let prompt = '';
+      
+      if (hasScript) {
+        prompt = `당신은 발표를 돕는 최고의 어시스턴트입니다. 다음 발표 대본을 발표자가 한눈에 보기 쉽게 '핵심 키워드 위주의 개조식(Bullet points)'으로 요약해 주세요. 너무 길지 않게 3~4줄로 부탁합니다.\n\n[원본 대본]\n${slide.original_note}`;
+      } else {
+        prompt = `당신은 발표를 돕는 최고의 어시스턴트입니다. 현재 슬라이드의 내용을 기반으로 자연스러운 발표용 스크립트(대본)를 짧게 3~4문장으로 작성해 주세요.`; 
+      }
+
+      // 새로 만든 헬퍼 함수 활용 (텍스트 기대)
+      const aiSummary = await callAiApiWithRetry(prompt, { isJsonExpected: false });
+      
+      updateStmt.run(aiSummary, slide.slide_id);
+      return { slideIndex: slide.slide_index, text: aiSummary };
+    });
+
+    const resolvedAiNotes = await Promise.all(aiPromises);
+    resolvedAiNotes.sort((a, b) => a.slideIndex - b.slideIndex);
+
+    const source = hasScript ? 'ai_summarize' : 'ai_generate';
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: resolvedAiNotes, source });
+    
+    res.json({ success: true, message: 'Gemini AI 처리 완료', slideNotes: resolvedAiNotes });
+
+  } catch (error) {
+    console.error('AI 처리 중 에러:', error);
+    res.status(500).json({ success: false, message: 'AI 요약 처리 중 문제가 발생했습니다.' });
+  }
+});
+
 
 app.put('/rooms/:roomId/slides/:slideIndex/note', (req, res) => {
   const { roomId, slideIndex } = req.params;
@@ -88,7 +384,7 @@ io.on('connection', (socket) => {
   // [1] 방 생성 & 입장 로직
   // ----------------------------------------------------
   socket.on(EVENTS.ROOM_CREATE, (payload = {}) => {
-    const { title, name } = payload; // 안전하게 구조 분해 진행
+    const { title, name } = payload; 
 
     if (!title || title.trim() === '') {
       return socket.emit('error', { message: '방 제목을 입력해주세요.' });
@@ -98,21 +394,19 @@ io.on('connection', (socket) => {
     const presenterCode = generateCode();
     const displayCode = generateCode();
     const audienceCode = generateCode();
-    const userId = generateUserId(); // 방장의 고정 user_id 생성
+    const userId = generateUserId(); 
 
     const stmt = db.prepare(`
       INSERT INTO rooms (room_id, title, host_user_id, current_presenter_id, presenter_code, display_code, audience_code, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'wait')
     `);
-    // socket.id 대신 userId를 host_user_id와 current_presenter_id로 저장
     stmt.run(roomId, title, userId, userId, presenterCode, displayCode, audienceCode);
 
-    // users 테이블에 user_id와 socket_id 분리 삽입
     db.prepare('INSERT OR REPLACE INTO users (user_id, socket_id, room_id, role, name) VALUES (?, ?, ?, ?, ?)')
       .run(userId, socket.id, roomId, 'host', name || '발표자');
 
     socket.join(roomId);
-    socket.emit(EVENTS.ROOM_CREATED, { roomId, title, displayCode, audienceCode, presenterCode, userId }); // userId도 응답에 포함
+    socket.emit(EVENTS.ROOM_CREATED, { roomId, title, displayCode, audienceCode, presenterCode, userId }); 
     broadcastPresenterList(roomId);
   });
 
@@ -120,13 +414,21 @@ io.on('connection', (socket) => {
     const room = db.prepare('SELECT * FROM rooms WHERE room_id = ? AND presenter_code = ?').get(roomId, presenterCode);
     if (!room) return socket.emit('error', { message: '방을 찾을 수 없거나 코드가 틀렸습니다.' });
 
-    const userId = generateUserId();
-    db.prepare('INSERT OR REPLACE INTO users (user_id, socket_id, room_id, role, name) VALUES (?, ?, ?, ?, ?)')
-      .run(userId, socket.id, roomId, 'presenter', name);
+    const existingHost = db.prepare("SELECT * FROM users WHERE socket_id = ? AND room_id = ? AND role = 'host'").get(socket.id, roomId);
+
+    let userId;
+    if (existingHost) {
+      userId = existingHost.user_id;
+      db.prepare('UPDATE users SET name = ? WHERE user_id = ?').run(name, userId);
+    } else {
+      userId = generateUserId();
+      db.prepare('INSERT OR REPLACE INTO users (user_id, socket_id, room_id, role, name) VALUES (?, ?, ?, ?, ?)')
+        .run(userId, socket.id, roomId, 'presenter', name);
+    }
 
     socket.join(roomId);
     socket.emit(EVENTS.ROOM_JOINED, {
-      roomId, role: 'presenter', userId, nickname: name, 
+      roomId, role: existingHost ? 'host' : 'presenter', userId, nickname: name, 
       title: room.title, 
       displayCode: room.display_code,
       presenterCode: room.presenter_code,
@@ -185,7 +487,6 @@ io.on('connection', (socket) => {
   // [2] 설정 변경 & 발표 시작/종료
   // ----------------------------------------------------
   socket.on(EVENTS.ROOM_SETTINGS_UPDATE, (payload) => {
-    //  권한 체크 로직 변경: socket.id를 통해 고정 user_id를 찾은 뒤 검증
     const user = db.prepare('SELECT user_id FROM users WHERE socket_id = ?').get(socket.id);
     if (!user) return;
 
@@ -235,7 +536,6 @@ io.on('connection', (socket) => {
     const user = db.prepare('SELECT user_id FROM users WHERE socket_id = ?').get(socket.id);
     if (!user) return;
 
-    // 현재 슬라이드 제어권이 있는 user_id인지 확인
     const room = db.prepare('SELECT * FROM rooms WHERE current_presenter_id = ?').get(user.user_id);
     if (!room || !room.started_at) return;
 
@@ -248,7 +548,6 @@ io.on('connection', (socket) => {
     db.prepare(`UPDATE rooms SET status = 'end', ended_at = ?, total_time_seconds = ?, total_presenters = ?, total_audience = ? WHERE room_id = ?`)
       .run(endTime, totalElapsedSeconds, presenterCount, audienceCount, room.room_id);
 
-    // 발표 종료 시점에 session_presenters 테이블에 참여자 스냅샷 저장
     const presenters = db.prepare("SELECT name FROM users WHERE room_id = ? AND role IN ('host', 'presenter')").all(room.room_id);
     const insertSession = db.prepare("INSERT INTO session_presenters (room_id, display_name_at_time, joined_at) VALUES (?, ?, ?)");
     for (const p of presenters) {
