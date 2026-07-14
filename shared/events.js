@@ -35,10 +35,27 @@ const EVENTS = {
 
   ROOM_CREATED: 'room:created',
   // payload: { roomId: string, title: string, displayCode: string, audienceCode: string, presenterCode: string, userId: string }
+  // ※ ROOM_CREATE_FROM_HISTORY 성공 시에도 동일한 이벤트로 응답한다 (아래 참고).
+
+  // [신규] "다시 발표하기" — 이전 발표 기록(GET /rooms/:roomId/history 로 봤던 것)의
+  // 발표 자료(PDF+슬라이드 이미지)와 노트를 그대로 복사해 새 방을 만든다.
+  ROOM_CREATE_FROM_HISTORY: 'room:create_from_history',
+  // payload: { sourceRoomId: string, title: string, token: string }  // 로그인 필수, 제목 입력 필수
+  // ※ sourceRoomId는 status='end'인 과거 방이어야 하고, 요청 계정이 그 방의 방장이었거나
+  //   참여 발표자였어야 한다(GET /rooms/:roomId/history와 동일한 권한 검사, 아니면 에러).
+  // ※ 응답은 ROOM_CREATED와 동일. 추가로 자료/노트가 이미 준비돼 있다는 걸 알리기 위해
+  //   FILE_READY, NOTES_READY도 같이 방출한다 — 프론트는 재업로드 없이 기존 업로드-완료
+  //   플로우 그대로(미리보기 등) 처리하면 된다.
 
   ROOM_JOIN_PRESENTER: 'room:join_presenter',
-  // payload: { roomId: string, presenterCode: string, name: string, userId?: string }
+  // payload: { presenterCode: string, name: string, userId?: string, token?: string }
+  // ※ [수정] roomId는 더 이상 필요 없음. display/audience 입장과 동일하게 presenterCode
+  //   하나만으로 방을 찾는다 — 방을 만든 사람이 아닌 다른 발표자는 애초에 roomId를 알 수 없고
+  //   "발표자 접속 코드"만 전달받으므로, roomId를 같이 요구하면 항상 실패했다.
   // ※ role은 서버가 (전달된) userId === room.host_user_id 여부로 판단해서 'host' | 'presenter'로 응답한다.
+  // ※ [수정] token(로그인 JWT)이 유효하면 ROOM_CREATE와 동일하게 userId 대신 accountId를 신원으로
+  //   사용한다. 방장뿐 아니라 다른 발표자도 로그인 계정에 연결되어야 "이전 발표 기록"에 각자의
+  //   참여 이력이 남는다 (스펙: 방장 말고 다른 발표자들도 기록 저장).
 
   ROOM_JOIN_DISPLAY: 'room:join_display',
   // payload: { displayCode: string, userId?: string }
@@ -53,9 +70,19 @@ const EVENTS = {
   //   role: 'host' | 'presenter' | 'display' | 'audience',
   //   userId: string,
   //   nickname: string | null,
-  //   currentFileUrl: string | null
+  //   currentFileUrl: string | null,
+  //   slideCount?: number,        // presenter 입장에만 포함. currentFileUrl이 있을 때만 의미 있는 값
+  //   hasScript?: boolean,        // presenter 입장에만 포함
+  //   status?: 'wait' | 'progress' | 'end',   // display/audience 입장에만 포함
+  //   allowMidQuestions?: boolean // audience 입장에만 포함
   // }
   // ※ 클라이언트는 여기서 받은 userId를 로컬에 저장해서 다음 재연결에 그대로 재사용해야 함.
+  // ※ [수정] slideCount/hasScript 추가. 자료가 이미 업로드된 방에 나중에 들어온 발표자는
+  //   file:ready(업로드 시점에만 방출)를 놓쳤기 때문에, currentFileUrl만으로는 "업로드는 됐는데
+  //   몇 장인지/대본이 있는지" 알 수 없어서 화면이 "업로드 안 됨" 상태로 잘못 뜨는 문제가 있었다.
+  // ※ [수정] status/allowMidQuestions 추가. 발표가 이미 시작된 뒤에 PC/청중이 (재)접속하면
+  //   이미 지나간 presentation:started 브로드캐스트를 영영 못 받아서 대기 화면에 멈춰있었다.
+  //   클라이언트는 status==='progress'면 join 응답만으로 바로 발표 화면으로 전환해야 한다.
 
   // 서버 → 모든 발표자 앱: 발표자 목록 (배열 길이 = 발표자 인원수)
   PRESENTER_LIST_UPDATE: 'presenter:list_update',
@@ -96,19 +123,16 @@ const EVENTS = {
   PRESENTATION_ENDED: 'presentation:ended',
   // payload: { totalElapsedSeconds: number, presenterCount: number, audienceCount: number }
 
-  // [신규] 현재 발표자 앱 → 서버: 발표 시작을 "취소"하고 대기 화면으로 되돌리기
-  // (예: 모바일 리모컨에서 첫 슬라이드보다 더 앞으로 스와이프한 경우)
-  // ※ PRESENTATION_END와 다름: END는 발표가 끝났다는 뜻이라 이후 Q&A 화면으로 진행되지만,
-  //   CANCEL은 "시작을 되돌린다"는 뜻이라 곧장 시작 전 상태(대기화면/QR화면)로 복귀해야 함
-  // ※ 권한: 보낸 사람 == 현재 currentPresenterId
+  // [신규] 현재 발표자 앱 → 서버: 발표 "시작 취소". 첫 번째 슬라이드에서만 발생하는
+  // UX(오른쪽 스와이프 + 확인 팝업)로, PRESENTATION_END(발표 "종료")와는 다르다 —
+  // 종료가 아니라 시작 자체를 무른 것이므로 질문 화면이 아니라 시작 전 대기 화면으로 돌아간다.
+  // ※ 권한: PRESENTATION_END와 동일하게 보낸 사람이 현재 currentPresenterId인지 검증.
   PRESENTATION_CANCEL: 'presentation:cancel',
   // payload: {}
 
-  // 서버 → 모든 발표자 앱 + PC웹 + 청중웹: 발표 취소 브로드캐스트
-  // ※ 서버는 room.status를 'wait'로 되돌리고, 진행 중이던 타이머를 정지해야 함
-  // ※ 발표자 앱: 대기화면(waiting)으로 이동
-  // ※ PC웹(display): QR/코드 보여주는 화면으로 복귀
-  // ※ 청중웹(audience): 대기 화면으로 복귀
+  // 서버 → 모든 발표자 앱 + PC웹 + 청중웹: 발표 시작 취소 브로드캐스트.
+  // ※ 서버는 room.status를 다시 'wait'로 되돌리고, 타이머를 멈추고, 슬라이드 위치를 1로 리셋한다.
+  // ※ PC웹은 QR코드 대기 화면으로, 청중웹은 "입장 완료, 시작 대기" 화면으로 복귀해야 한다.
   PRESENTATION_CANCELLED: 'presentation:cancelled',
   // payload: {}
 
@@ -155,12 +179,20 @@ const EVENTS = {
 
   NOTES_READY: 'notes:ready',
   // payload: {
-  //   slideNotes: Array<{ slideIndex: number, text: string }>,
-  //   source: 'auto_split' | 'ai_summarize' | 'ai_generate' | 'manual'
+  //   slideNotes: Array<{ slideIndex: number, text: string, imageUrl: string | null }>,
+  //   source: 'auto_split' | 'ai_summarize' | 'ai_generate' | 'manual',
+  //   hasScript: boolean
   // }
+  // ※ [수정] imageUrl 추가. 노트 수정 화면이 이 이벤트만으로 텍스트+슬라이드 이미지를
+  //   같이 그릴 수 있도록(별도로 GET /rooms/:roomId/slides를 다시 호출할 필요 없게) 함.
+  // ※ [수정] hasScript 추가. "대본이 있다"는 사실이 rooms.has_script로 서버에 저장되므로,
+  //   대본을 업로드/AI처리한 사람뿐 아니라 같은 방의 다른 발표자도 이 이벤트로 상태를 맞출 수 있다.
+  //   재연결/늦은 입장 시엔 GET /rooms/:roomId의 hasScript 필드로 복구한다.
 
   NOTE_SAVED: 'note:saved',
-  // payload: { slideIndex: number, editedByName: string }
+  // payload: { slideIndex: number, editedByName: string, newNote: string, imageUrl: string | null }
+  // ※ [수정] newNote/imageUrl 추가. 다른 발표자 화면이 이 이벤트만으로 수정된 노트 내용과
+  //   해당 슬라이드 이미지를 그대로 반영할 수 있게 함.
 
 
   // ══════════════════════════════════════════════
@@ -172,6 +204,7 @@ const EVENTS = {
   // ※ [수정] category는 더 이상 클라이언트가 정하지 않음. 클라이언트를 신뢰하면
   //   항상 같은 값(예: 'during')만 보내는 등 신뢰할 수 없어서, 서버가 room.status로
   //   'during'(진행중) | 'after'(종료 후)를 직접 판단해 저장한다.
+  // ※ [수정] role이 'audience'가 아니면 에러 응답 — 청중 전용 이벤트
 
   QUESTION_NEW: 'question:new',
   // payload: { questionId: string, text: string, nickname: string, category: 'during' | 'after', createdAt: number }
@@ -181,6 +214,7 @@ const EVENTS = {
   QUESTION_ANSWERING_START: 'question:answering_start',
   // payload: { questionId: string }
   // ※ 서버는 현재 answeringPresenterId가 null인지 검증. 이미 다른 사람이 답변 중이면 에러 응답
+  // ※ [수정] 대상 질문이 이미 status='completed'(답변 완료)면 다시 answering으로 못 돌림 — 에러 응답
 
   // [신규] 서버 → 모든 발표자 앱 + PC웹 + 청중웹: 답변 시작 브로드캐스트
   QUESTION_ANSWERING_STARTED: 'question:answering_started',

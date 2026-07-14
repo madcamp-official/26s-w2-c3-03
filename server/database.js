@@ -32,6 +32,7 @@ db.exec(`
     -- 발표 진행 상태
     file_url TEXT,                                  -- 발표 자료 URL
     script_url TEXT,                                -- 발표 대본 URL
+    has_script INTEGER DEFAULT 0,                   -- 대본 업로드 여부 (방 단위 서버 상태 — 클라이언트가 알아서 판단하지 않게 함)
     status TEXT DEFAULT 'wait',                     -- 'wait'(대기) -> 'progress'(발표중) -> 'end'(종료)
     current_presenter_id TEXT,                      -- 현재 슬라이드 제어권을 가진 발표자의 고정 user_id
 
@@ -53,6 +54,31 @@ db.exec(`
     account_id TEXT,                                -- 참여한 발표자의 회원 계정 ID (로그인 안 한 발표자면 null)
     display_name_at_time TEXT,                      -- 발표 당시 사용했던 이름 (동명이인/개명 대비 스냅샷)
     joined_at INTEGER                               -- 합류한 시간
+  );
+
+  -- [신규] 방에 "한 번이라도" 들어왔던 사람을 전부 남겨두는 테이블. users 테이블은 연결이 끊기면
+  -- 행이 삭제되기 때문에, 발표 종료 시점에 users만 보고 "총 발표자/청중 수"나 "누가 참여했는지"를
+  -- 계산하면 중간에 나갔다 들어온 사람이 통째로 빠지는 문제가 있었다. 입장하는 순간 바로 기록해서
+  -- 발표가 끝날 때 이 테이블만 보면 정확한 참여 이력을 알 수 있게 한다.
+  CREATE TABLE IF NOT EXISTS room_participants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT,
+    user_id TEXT,
+    account_id TEXT,                                -- 로그인 안 했으면 null
+    role TEXT,                                       -- 'host' | 'presenter' | 'audience' (display는 집계 대상 아님)
+    display_name_at_time TEXT,
+    first_joined_at INTEGER,
+    UNIQUE(room_id, user_id)
+  );
+
+  -- [신규] "발표 기록 삭제"용 — 실제로 방/자료를 지우지는 않고, 이 계정의 "이전 발표 기록"
+  -- 목록에서만 숨긴다. 같은 방이 여러 발표자의 개인 기록에 동시에 나타날 수 있어서, 한 명이
+  -- 지운다고 다른 참여자의 기록까지 같이 사라지면 안 되기 때문에 계정별로 숨김 처리한다.
+  CREATE TABLE IF NOT EXISTS hidden_history (
+    room_id TEXT,
+    account_id TEXT,
+    hidden_at INTEGER,
+    UNIQUE(room_id, account_id)
   );
 
   -- 2. 유저 테이블 (현재 방에 접속한 사람들 - 임시 데이터)
@@ -101,6 +127,12 @@ try {
 
 try {
   db.exec(`ALTER TABLE slides ADD COLUMN image_url TEXT`);
+} catch (e) {
+  // 이미 컬럼이 있으면(신규 DB) 무시
+}
+
+try {
+  db.exec(`ALTER TABLE rooms ADD COLUMN has_script INTEGER DEFAULT 0`);
 } catch (e) {
   // 이미 컬럼이 있으면(신규 DB) 무시
 }
