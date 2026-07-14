@@ -399,14 +399,24 @@ app.post('/rooms/:roomId/script', upload.single('scriptFile'), async (req, res) 
     console.log(`[DEBUG: /script] Gemini 매칭 완료! 반환된 배열 길이: ${slideNotes.length}`);
 
     // INSERT OR REPLACE 대신 UPDATE를 사용하여 기존에 만들어둔 빈 방에 텍스트만 덮어씌웁니다.
-    const stmt = db.prepare('UPDATE slides SET original_note = ? WHERE room_id = ? AND slide_index = ?');
+    // [수정] original_note(원본 대본)만 갱신하고 ai_summary_note(실제 "발표자 노트")는 안 건드리고
+    // 있었음. 그래서 대본 없이 미리 손으로 고쳐뒀거나 AI로 생성해둔 노트가 있는 상태에서 나중에
+    // 대본을 올리면, 발표자 노트는 그 옛날 내용 그대로 남고 새 대본 내용이 반영되지 않았음.
+    // 스펙상 "대본 업로드 시 자동으로 슬라이드별 대본 내용을 분리해 발표자 노트 생성"이므로,
+    // 대본이 올라오면 그 시점까지의 발표자 노트(수정본 포함)는 버리고 새 대본 내용으로 덮어쓴다.
+    const stmt = db.prepare('UPDATE slides SET original_note = ?, ai_summary_note = ? WHERE room_id = ? AND slide_index = ?');
     const updateNotes = db.transaction(() => {
       for (const note of slideNotes) {
-        stmt.run(note.text, roomId, note.slideIndex);
+        stmt.run(note.text, note.text, roomId, note.slideIndex);
       }
     });
     updateNotes();
     console.log(`[DEBUG: /script] DB 대본 UPDATE 완료`);
+
+    // [수정] "대본이 있다"는 사실을 방 상태로 저장한다. 예전엔 이 값이 서버 어디에도 저장되지
+    // 않고 매 요청마다 클라이언트가 알아서 hasScript를 보내야 했는데, 그러면 대본을 업로드한
+    // 사람 화면만 상태가 바뀌고 같은 방의 다른 발표자는 그 사실을 알 방법이 없었다.
+    db.prepare('UPDATE rooms SET has_script = 1 WHERE room_id = ?').run(roomId);
 
     // [수정] slideNotes에 imageUrl이 없어서, 이 이벤트/응답만 보고 노트 수정 화면을 그리면
     // 슬라이드 이미지 없이 텍스트만 나오는 문제가 있었음. DB에 이미 저장된 image_url을 붙여준다.
@@ -414,7 +424,8 @@ app.post('/rooms/:roomId/script', upload.single('scriptFile'), async (req, res) 
     const imageUrlBySlideIndex = Object.fromEntries(imageRows.map(r => [r.slide_index, r.image_url]));
     const slideNotesWithImages = slideNotes.map(note => ({ ...note, imageUrl: imageUrlBySlideIndex[note.slideIndex] || null }));
 
-    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: slideNotesWithImages, source: 'ai_context_split' });
+    // [수정] hasScript를 이벤트에 실어서, 같은 방의 다른 발표자 화면도 "대본 업로드됨" 상태로 동기화되게 함
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: slideNotesWithImages, source: 'ai_context_split', hasScript: true });
     console.log(`[DEBUG: /script] 프론트엔드로 소켓 이벤트(NOTES_READY) 방출 완료`);
 
     // DB에서 가져온 정확한 slideCount를 프론트엔드에 응답합니다.
@@ -437,11 +448,20 @@ app.post('/rooms/:roomId/script', upload.single('scriptFile'), async (req, res) 
 // 3. AI 노트 요약/생성 API
 app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
   const { roomId } = req.params;
-  const { hasScript } = req.body; 
 
   try {
+    const room = db.prepare('SELECT has_script FROM rooms WHERE room_id = ?').get(roomId);
+    if (!room) {
+      return res.status(404).json({ success: false, message: '방을 찾을 수 없습니다.' });
+    }
+    // [수정] hasScript를 요청 body(클라이언트가 알아서 판단한 값)에서 더 이상 신뢰하지 않는다.
+    // 방마다 실제로 대본이 업로드됐는지는 서버(rooms.has_script)만 알고 있는 사실이라,
+    // 클라이언트가 잘못 알고 있으면(다른 발표자가 방금 대본을 올린 걸 모르는 등) 빈 원문을
+    // 요약하려 들거나, 반대로 실제 있는 대본을 무시하는 문제가 생길 수 있었다.
+    const hasScript = !!room.has_script;
+
     const slides = db.prepare('SELECT * FROM slides WHERE room_id = ? ORDER BY slide_index ASC').all(roomId);
-    
+
     if (slides.length === 0) {
       return res.status(404).json({ success: false, message: '처리할 슬라이드/대본 데이터가 없습니다.' });
     }
@@ -488,9 +508,9 @@ app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
     resolvedAiNotes.sort((a, b) => a.slideIndex - b.slideIndex);
 
     const source = hasScript ? 'ai_summarize' : 'ai_generate';
-    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: resolvedAiNotes, source });
-    
-    res.json({ success: true, message: 'Gemini AI 처리 완료', slideNotes: resolvedAiNotes });
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: resolvedAiNotes, source, hasScript });
+
+    res.json({ success: true, message: 'Gemini AI 처리 완료', slideNotes: resolvedAiNotes, hasScript });
 
   } catch (error) {
     console.error('AI 처리 중 에러:', error);
@@ -532,6 +552,7 @@ app.get('/rooms/:roomId', (req, res) => {
       isAnonymous: !!room.is_anonymous,
       allowMidQuestions: !!room.allow_mid_questions,
       fileUrl: room.file_url,
+      hasScript: !!room.has_script,
       currentSlideIndex: roomSlides[roomId] || 1,
       startedAt: room.started_at
     }
@@ -577,6 +598,92 @@ app.get('/rooms/:roomId/questions', (req, res) => {
   }));
 
   res.json({ success: true, questions: formattedQuestions });
+});
+
+// [신규] Authorization: Bearer <token> 헤더에서 로그인 계정을 꺼내는 공용 헬퍼.
+// 무효/누락 시 null — 호출부가 401로 응답할지는 각자 판단한다.
+function getAuthAccount(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  return verifyToken(token);
+}
+
+// [신규] 로그인한 계정의 "이전 발표 기록" 목록.
+// 방장으로 만든 방(owner_account_id)뿐 아니라, 다른 발표자로 참여했던 방(session_presenters)도
+// 포함한다 — 스펙: "방장 말고 다른 발표자들도 기록 저장". 종료된(status='end') 발표만 대상.
+app.get('/accounts/me/rooms', (req, res) => {
+  const account = getAuthAccount(req);
+  if (!account) {
+    return res.status(401).json({ success: false, message: '로그인이 필요합니다.' });
+  }
+
+  const rooms = db.prepare(`
+    SELECT DISTINCT r.room_id as roomId, r.title, r.ended_at as endedAt,
+           r.total_time_seconds as totalTimeSeconds, r.total_presenters as totalPresenters,
+           r.total_audience as totalAudience
+    FROM rooms r
+    LEFT JOIN session_presenters sp ON sp.room_id = r.room_id
+    WHERE r.status = 'end' AND (r.owner_account_id = ? OR sp.account_id = ?)
+    ORDER BY r.ended_at DESC
+  `).all(account.accountId, account.accountId);
+
+  res.json({ success: true, rooms });
+});
+
+// [신규] 발표 기록 상세 — 발표 자료, 대본/발표자 노트(슬라이드별), 답변한 질문, 총 발표 시간,
+// 발표자 리스트를 한 번에 반환한다. "다시 발표하기"에서 이 데이터를 그대로 재사용할 수 있다.
+app.get('/rooms/:roomId/history', (req, res) => {
+  const { roomId } = req.params;
+  const account = getAuthAccount(req);
+  if (!account) {
+    return res.status(401).json({ success: false, message: '로그인이 필요합니다.' });
+  }
+
+  const room = db.prepare('SELECT * FROM rooms WHERE room_id = ?').get(roomId);
+  if (!room || room.status !== 'end') {
+    return res.status(404).json({ success: false, message: '완료된 발표 기록을 찾을 수 없습니다.' });
+  }
+
+  // 이 방을 만들었거나(owner) 발표자로 참여했던 계정만 열람 가능
+  const isParticipant = room.owner_account_id === account.accountId ||
+    !!db.prepare('SELECT 1 FROM session_presenters WHERE room_id = ? AND account_id = ?').get(roomId, account.accountId);
+  if (!isParticipant) {
+    return res.status(403).json({ success: false, message: '이 발표 기록을 볼 권한이 없습니다.' });
+  }
+
+  const slides = db.prepare(
+    'SELECT slide_index, original_note, ai_summary_note, image_url FROM slides WHERE room_id = ? ORDER BY slide_index ASC'
+  ).all(roomId).map(s => ({
+    slideIndex: s.slide_index,
+    originalNote: s.original_note,
+    aiSummaryNote: s.ai_summary_note,
+    imageUrl: s.image_url
+  }));
+
+  const answeredQuestions = db.prepare(`
+    SELECT question_id as questionId, content as text, author_name as nickname, completed_at as answeredAt
+    FROM questions WHERE room_id = ? AND status = 'completed' ORDER BY completed_at DESC
+  `).all(roomId).map(q => ({ ...q, questionId: String(q.questionId) }));
+
+  const presenters = db.prepare(
+    'SELECT account_id as accountId, display_name_at_time as name, joined_at as joinedAt FROM session_presenters WHERE room_id = ? ORDER BY joined_at ASC'
+  ).all(roomId);
+
+  res.json({
+    success: true,
+    history: {
+      roomId: room.room_id,
+      title: room.title,
+      fileUrl: room.file_url,
+      hasScript: !!room.has_script,
+      totalTimeSeconds: room.total_time_seconds,
+      startedAt: room.started_at,
+      endedAt: room.ended_at,
+      presenters,
+      slides,
+      answeredQuestions,
+    }
+  });
 });
 
 // =========================================================================
@@ -651,26 +758,135 @@ io.on('connection', (socket) => {
     broadcastPresenterList(roomId);
   });
 
-  socket.on(EVENTS.ROOM_JOIN_PRESENTER, ({ roomId, presenterCode, name, userId: clientUserId }) => {
-    const room = db.prepare('SELECT * FROM rooms WHERE room_id = ? AND presenter_code = ?').get(roomId, presenterCode);
+  // [신규] 이전 발표 기록의 자료(PDF/슬라이드 이미지)와 노트를 그대로 복사해 새 방을 만든다
+  // ("다시 발표하기"). 로그인 계정만 가능하고, 그 발표 기록의 방장이었거나 참여했던 발표자만
+  // 재사용할 수 있다(GET /rooms/:roomId/history와 동일한 권한 검사).
+  socket.on(EVENTS.ROOM_CREATE_FROM_HISTORY, ({ sourceRoomId, title, token } = {}) => {
+    const account = verifyToken(token);
+    if (!account) {
+      return socket.emit('error', { message: '로그인이 필요합니다.' });
+    }
+    if (!title || title.trim() === '') {
+      return socket.emit('error', { message: '방 제목을 입력해주세요.' });
+    }
+
+    const sourceRoom = db.prepare("SELECT * FROM rooms WHERE room_id = ? AND status = 'end'").get(sourceRoomId);
+    if (!sourceRoom) {
+      return socket.emit('error', { message: '재사용할 발표 기록을 찾을 수 없습니다.' });
+    }
+
+    const isParticipant = sourceRoom.owner_account_id === account.accountId ||
+      !!db.prepare('SELECT 1 FROM session_presenters WHERE room_id = ? AND account_id = ?').get(sourceRoomId, account.accountId);
+    if (!isParticipant) {
+      return socket.emit('error', { message: '이 발표 기록을 재사용할 권한이 없습니다.' });
+    }
+
+    const sourceSlides = db.prepare('SELECT * FROM slides WHERE room_id = ? ORDER BY slide_index ASC').all(sourceRoomId);
+    if (sourceSlides.length === 0) {
+      return socket.emit('error', { message: '재사용할 발표 자료가 없습니다.' });
+    }
+
+    const roomId = generateCode();
+    const presenterCode = generateCode();
+    const displayCode = generateCode();
+    const audienceCode = generateCode();
+    const userId = account.accountId;
+
+    // 발표 자료(PDF) 복사 — 파일명이 roomId로 묶여 있으므로 새 roomId 이름으로 복사해서
+    // 이후 슬라이드 재업로드 등 기존 파이프라인과 완전히 독립적으로 동작하게 한다.
+    const sourcePdfPath = path.join(UPLOAD_DIR, `${sourceRoomId}_presentation.pdf`);
+    const newPdfPath = path.join(UPLOAD_DIR, `${roomId}_presentation.pdf`);
+    let fileUrl = null;
+    if (fs.existsSync(sourcePdfPath)) {
+      fs.copyFileSync(sourcePdfPath, newPdfPath);
+      fileUrl = `/files/${roomId}_presentation.pdf`;
+    }
+
+    // 슬라이드별 이미지 + 노트(원본 대본/발표자 노트) 복사
+    const insertSlide = db.prepare(
+      'INSERT INTO slides (slide_id, room_id, slide_index, original_note, ai_summary_note, image_url) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    const copySlides = db.transaction(() => {
+      for (const slide of sourceSlides) {
+        let newImageUrl = null;
+        if (slide.image_url) {
+          const sourceImgPath = path.join(UPLOAD_DIR, path.basename(slide.image_url));
+          const newImgPath = path.join(UPLOAD_DIR, `${roomId}_slide_${slide.slide_index}.png`);
+          if (fs.existsSync(sourceImgPath)) {
+            fs.copyFileSync(sourceImgPath, newImgPath);
+            newImageUrl = `/files/${roomId}_slide_${slide.slide_index}.png`;
+          }
+        }
+        insertSlide.run(`${roomId}_${slide.slide_index}`, roomId, slide.slide_index, slide.original_note, slide.ai_summary_note, newImageUrl);
+      }
+    });
+    copySlides();
+
+    db.prepare(`
+      INSERT INTO rooms (room_id, title, host_user_id, current_presenter_id, presenter_code, display_code, audience_code, status, owner_account_id, file_url, has_script)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'wait', ?, ?, ?)
+    `).run(roomId, title, userId, userId, presenterCode, displayCode, audienceCode, userId, fileUrl, sourceRoom.has_script);
+
+    upsertUser(userId, socket.id, roomId, 'host', account.name);
+    socket.join(roomId);
+
+    socket.emit(EVENTS.ROOM_CREATED, { roomId, title, displayCode, audienceCode, presenterCode, userId });
+
+    // [신규] 이미 자료/노트가 준비돼 있다는 걸 기존 이벤트(FILE_READY/NOTES_READY)로 알려서,
+    // 프론트가 재업로드 없이 기존 업로드 완료 플로우 그대로 미리보기를 그릴 수 있게 한다.
+    const slideCount = sourceSlides.length;
+    if (fileUrl) {
+      io.to(roomId).emit(EVENTS.FILE_READY, { fileId: `${roomId}_presentation`, ownerId: userId, slideCount, fileUrl });
+    }
+    const slideNotes = sourceSlides.map(s => ({
+      slideIndex: s.slide_index,
+      text: s.ai_summary_note || '',
+      imageUrl: s.image_url ? `/files/${roomId}_slide_${s.slide_index}.png` : null
+    }));
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes, source: 'manual', hasScript: !!sourceRoom.has_script });
+
+    broadcastPresenterList(roomId);
+  });
+
+  socket.on(EVENTS.ROOM_JOIN_PRESENTER, ({ presenterCode, name, userId: clientUserId, token }) => {
+    // [수정] PC/청중 입장(display_code, audience_code)은 코드 하나만으로 방을 찾는데,
+    // 여기만 roomId까지 같이 요구하고 있었음. 처음 방을 만든 사람이 아닌 다른 발표자는애초에
+    // roomId를 알 방법이 없고 "발표자 접속 코드"만 전달받으므로, 코드만 보내면 항상 실패했음.
+    // presenter_code만으로 조회하도록 통일.
+    const room = db.prepare('SELECT * FROM rooms WHERE presenter_code = ?').get(presenterCode);
     if (!room) return socket.emit('error', { message: '방을 찾을 수 없거나 코드가 틀렸습니다.' });
 
-    // [수정] socket_id로 "방금 만든 사람인가"를 추측하던 방식을 제거.
-    // 클라이언트가 보관 중인 고정 userId를 그대로 신뢰하고, 그게 방장(host_user_id)과 같은지로 역할을 정한다.
-    // 이렇게 하면 앱이 재연결돼도(새 socket, 같은 userId) 같은 사람으로 인식되어 발표 제어권을 잃지 않는다.
-    const userId = clientUserId || generateUserId();
+    const roomId = room.room_id;
+
+    // [수정] ROOM_CREATE와 동일하게, 로그인한 발표자면 accountId를 그대로 userId로 쓴다.
+    // 방장뿐 아니라 다른 발표자도 계정에 귀속돼야 나중에 "이전 발표 기록"에 이 발표자의
+    // 참여 이력을 남길 수 있다 (스펙: "방장 말고 다른 발표자들도 기록 저장").
+    // 토큰이 없거나 무효하면(비로그인) 기존처럼 클라이언트가 들고 있는 익명 userId를 그대로 쓴다.
+    const account = verifyToken(token);
+    const userId = account ? account.accountId : (clientUserId || generateUserId());
+    const displayName = account ? account.name : name;
     const role = userId === room.host_user_id ? 'host' : 'presenter';
 
-    upsertUser(userId, socket.id, roomId, role, name);
+    upsertUser(userId, socket.id, roomId, role, displayName);
 
     socket.join(roomId);
+
+    // [수정] 자료가 이미 업로드된 방에 나중에 들어온 발표자는 FILE_READY(업로드 시점에만 쏨)를
+    // 놓쳤기 때문에, currentFileUrl만으로는 "업로드는 됐는데 몇 장인지/대본이 있는지" 알 수 없었다.
+    // 이 값들도 같이 실어보내서, 늦게 들어온 발표자 화면도 별도 조회 없이 바로 "업로드 완료" 상태를 그릴 수 있게 한다.
+    const slideCount = room.file_url
+      ? db.prepare('SELECT COUNT(*) as count FROM slides WHERE room_id = ?').get(roomId).count
+      : 0;
+
     socket.emit(EVENTS.ROOM_JOINED, {
-      roomId, role, userId, nickname: name,
-      title: room.title, 
+      roomId, role, userId, nickname: displayName,
+      title: room.title,
       displayCode: room.display_code,
       presenterCode: room.presenter_code,
-      audienceCode: null, 
-      currentFileUrl: room.file_url || null
+      audienceCode: null,
+      currentFileUrl: room.file_url || null,
+      slideCount,
+      hasScript: !!room.has_script
     });
     broadcastPresenterList(roomId);
   });
@@ -684,13 +900,16 @@ io.on('connection', (socket) => {
     upsertUser(userId, socket.id, room.room_id, 'display', null);
 
     socket.join(room.room_id);
+    // [수정] status가 없어서, 발표가 이미 시작된 뒤에 PC가 (재)접속하면 이미 지나간
+    // presentation:started 브로드캐스트를 영영 못 받아 대기 화면에 멈춰있었다.
     socket.emit(EVENTS.ROOM_JOINED, {
-      roomId: room.room_id, role: 'display', userId, nickname: null, 
-      title: room.title, 
-      displayCode: null, 
-      presenterCode: null, 
-      audienceCode: room.audience_code, 
-      currentFileUrl: room.file_url || null
+      roomId: room.room_id, role: 'display', userId, nickname: null,
+      title: room.title,
+      displayCode: null,
+      presenterCode: null,
+      audienceCode: room.audience_code,
+      currentFileUrl: room.file_url || null,
+      status: room.status
     });
   });
 
@@ -707,13 +926,18 @@ io.on('connection', (socket) => {
     upsertUser(userId, socket.id, room.room_id, 'audience', name);
 
     socket.join(room.room_id);
+    // [수정] status/allowMidQuestions가 없어서, 발표가 이미 시작된 뒤에 들어온(QR로 늦게 스캔한)
+    // 청중은 이미 지나간 presentation:started 브로드캐스트를 못 받아 "대기 중" 화면에 영영
+    // 멈춰있었다. 입장 시점에 방 상태를 그대로 실어보내서 클라이언트가 즉시 판단할 수 있게 한다.
     socket.emit(EVENTS.ROOM_JOINED, {
-      roomId: room.room_id, 
-      title: room.title, 
-      role: 'audience', 
-      userId, 
-      nickname: name, 
-      currentFileUrl: room.file_url || null
+      roomId: room.room_id,
+      title: room.title,
+      role: 'audience',
+      userId,
+      nickname: name,
+      currentFileUrl: room.file_url || null,
+      status: room.status,
+      allowMidQuestions: !!room.allow_mid_questions
     });
 
     const countQuery = db.prepare("SELECT COUNT(*) as count FROM users WHERE room_id = ? AND role = 'audience'").get(room.room_id);
@@ -798,10 +1022,15 @@ io.on('connection', (socket) => {
 
     // [수정] joined_at에 Date.now()(=종료 시각)를 넣고 있던 버그.
     // users 테이블에 실제 입장 시각을 저장해두므로 그 값을 그대로 스냅샷에 옮긴다.
-    const presenters = db.prepare("SELECT name, joined_at FROM users WHERE room_id = ? AND role IN ('host', 'presenter')").all(room.room_id);
-    const insertSession = db.prepare("INSERT INTO session_presenters (room_id, display_name_at_time, joined_at) VALUES (?, ?, ?)");
+    const presenters = db.prepare("SELECT user_id, name, joined_at FROM users WHERE room_id = ? AND role IN ('host', 'presenter')").all(room.room_id);
+    const insertSession = db.prepare("INSERT INTO session_presenters (room_id, account_id, display_name_at_time, joined_at) VALUES (?, ?, ?, ?)");
+    // [수정] 로그인한 발표자는 users.user_id가 곧 accounts.account_id이므로(ROOM_CREATE/ROOM_JOIN_PRESENTER
+    // 참고), accounts 테이블에 실제로 존재하는 id인지만 확인하면 "이 발표자가 로그인 상태였는지"를
+    // 알 수 있다. 비로그인 발표자는 account_id를 null로 남겨서 "이전 발표 기록" 조회에서 자연히 제외된다.
+    const findAccount = db.prepare('SELECT account_id FROM accounts WHERE account_id = ?');
     for (const p of presenters) {
-      insertSession.run(room.room_id, p.name || '발표자', p.joined_at || Date.now());
+      const account = findAccount.get(p.user_id);
+      insertSession.run(room.room_id, account ? account.account_id : null, p.name || '발표자', p.joined_at || Date.now());
     }
 
     io.to(room.room_id).emit(EVENTS.PRESENTATION_ENDED, { totalElapsedSeconds, presenterCount, audienceCount });
@@ -810,6 +1039,29 @@ io.on('connection', (socket) => {
       clearInterval(roomTimers[room.room_id]);
       delete roomTimers[room.room_id];
     }
+  });
+
+  // [신규] 발표 "시작 취소" — PRESENTATION_END(종료)와 달리 질문 화면으로 보내지 않고
+  // 시작 전 대기 상태로 되돌린다. 첫 번째 슬라이드에서 오른쪽 스와이프 확인 시 모바일 앱이 보냄.
+  socket.on(EVENTS.PRESENTATION_CANCEL, () => {
+    const user = db.prepare('SELECT user_id, room_id FROM users WHERE socket_id = ?').get(socket.id);
+    if (!user) return;
+
+    // [수정] PRESENTATION_END와 동일한 패턴: current_presenter_id만으로 찾으면 같은 userId를
+    // 가진 다른 방과 혼동될 수 있으므로 이 소켓이 실제로 join한 room_id로 좁힌다.
+    const room = db.prepare("SELECT * FROM rooms WHERE room_id = ? AND current_presenter_id = ? AND status = 'progress'").get(user.room_id, user.user_id);
+    if (!room) return;
+
+    db.prepare("UPDATE rooms SET status = 'wait', started_at = NULL WHERE room_id = ?").run(room.room_id);
+
+    // 진행 중이던 타이머와 슬라이드 위치를 리셋 — 다음에 다시 시작하면 처음부터 시작한다.
+    if (roomTimers[room.room_id]) {
+      clearInterval(roomTimers[room.room_id]);
+      delete roomTimers[room.room_id];
+    }
+    roomSlides[room.room_id] = 1;
+
+    io.to(room.room_id).emit(EVENTS.PRESENTATION_CANCELLED, {});
   });
 
   // ----------------------------------------------------

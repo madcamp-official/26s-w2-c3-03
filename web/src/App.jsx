@@ -1,7 +1,7 @@
 // web/src/App.jsx
 import { BrowserRouter, Routes, Route, useSearchParams, Link } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react'; 
 
 const socket = io(`http://${window.location.hostname}:4000`);
@@ -56,6 +56,22 @@ const fetchSlideImages = async (roomId, setSlideImages) => {
   }
 };
 
+// [신규] 새로고침/재접속 시에도 지금까지 등록된 질문을 채팅처럼 그대로 다시 보여주기 위해
+// REST로 전체 질문 목록을 받아온다(상태별로 pending/answering/completed).
+const fetchQuestions = async (roomId, setQuestions) => {
+  try {
+    const res = await fetch(`${API_BASE}/rooms/${roomId}/questions`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const mapped = (data.questions || [])
+      .map(q => ({ questionId: q.questionId, text: q.text, nickname: q.nickname, createdAt: q.createdAt, status: q.status }))
+      .sort((a, b) => a.createdAt - b.createdAt);
+    setQuestions(mapped);
+  } catch (e) {
+    console.error('질문 목록을 불러오지 못했습니다.', e);
+  }
+};
+
 // =========================================================================
 // [화면 0] 임시 발표자 앱 리모컨 (HomeView) - 테스트용
 // =========================================================================
@@ -81,14 +97,86 @@ const HomeView = () => {
   const [authName, setAuthName] = useState('');
   const [authError, setAuthError] = useState('');
 
+  // [테스트용] 다른 브라우저 탭에서 "발표자 코드"로 기존 방에 두 번째 발표자로 참가 (교차 클라이언트 동기화 확인용)
+  const [joinPresenterCode, setJoinPresenterCode] = useState('');
+  const [joinPresenterName, setJoinPresenterName] = useState('발표자2');
+  const [joinedPresenterInfo, setJoinedPresenterInfo] = useState(null);
+
+  // [테스트용] 발표자 노트 저장 + 실시간 수신 확인
+  const [noteSlideIndex, setNoteSlideIndex] = useState(1);
+  const [noteText, setNoteText] = useState('');
+  const [noteSaveStatus, setNoteSaveStatus] = useState('');
+  const [receivedNoteUpdate, setReceivedNoteUpdate] = useState(null);
+
+  // [테스트용] 이전 발표 기록 목록/상세
+  const [historyRooms, setHistoryRooms] = useState(null);
+  const [historyDetail, setHistoryDetail] = useState(null);
+
+  // 이 탭이 방과 어떻게 연결돼 있든(직접 생성 or 발표자 코드로 참가) 같은 roomId를 쓰도록 통일
+  const activeRoomId = testRoomInfo?.roomId || joinedPresenterInfo?.roomId || null;
+
   useEffect(() => {
     socket.on('timer:update', (data) => setTimerData(data));
     socket.on('error', (err) => alert(`오류: ${err.message}`));
+    socket.on('room:joined', (data) => setJoinedPresenterInfo(data));
+    // [테스트용] 다른 발표자가 노트를 저장하면 실시간으로 이 화면에도 반영되는지 확인
+    socket.on('note:saved', (data) => setReceivedNoteUpdate({ ...data, receivedAt: new Date().toLocaleTimeString() }));
     return () => {
       socket.off('timer:update');
       socket.off('error');
+      socket.off('room:joined');
+      socket.off('note:saved');
     };
   }, []);
+
+  const handleLoadHistory = async () => {
+    if (!auth.token) return;
+    setHistoryDetail(null);
+    const res = await fetch(`${API_BASE}/accounts/me/rooms`, { headers: { Authorization: `Bearer ${auth.token}` } });
+    const data = await res.json();
+    setHistoryRooms(data.rooms || []);
+  };
+
+  const handleLoadHistoryDetail = async (roomId) => {
+    const res = await fetch(`${API_BASE}/rooms/${roomId}/history`, { headers: { Authorization: `Bearer ${auth.token}` } });
+    const data = await res.json();
+    setHistoryDetail(data.success ? data.history : { error: data.message });
+  };
+
+  // [테스트용] 이전 발표 기록의 자료/노트를 그대로 복사해 새 방으로 다시 발표하기
+  const handleReplayFromHistory = (sourceRoomId, originalTitle) => {
+    socket.emit('room:create_from_history', {
+      sourceRoomId,
+      title: `${originalTitle} (재발표)`,
+      token: auth.token,
+    });
+    socket.once('room:created', (data) => {
+      setTestRoomInfo(data);
+      if (data.userId) localStorage.setItem('kit_userId_host', data.userId);
+    });
+  };
+
+  const handleJoinAsPresenter = () => {
+    const myUserId = getOrCreateUserId('kit_userId_presenter_test');
+    // 로그인 상태면 토큰을 같이 보내서, 서버가 이 발표자도 계정에 연결하게 한다.
+    socket.emit('room:join_presenter', { presenterCode: joinPresenterCode, name: joinPresenterName, userId: myUserId, token: auth.token });
+  };
+
+  const handleSaveNote = async () => {
+    if (!activeRoomId) return;
+    setNoteSaveStatus('저장 중...');
+    try {
+      const res = await fetch(`${API_BASE}/rooms/${activeRoomId}/slides/${noteSlideIndex}/note`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newNote: noteText, editedByName: joinedPresenterInfo?.nickname || '방장' }),
+      });
+      const data = await res.json();
+      setNoteSaveStatus(data.success ? '저장 완료' : `실패: ${data.message}`);
+    } catch (e) {
+      setNoteSaveStatus(`오류: ${e.message}`);
+    }
+  };
 
   // 새로고침해도 로그인 상태가 유지되도록, 저장된 토큰이 아직 유효한지 서버에 확인
   useEffect(() => {
@@ -195,7 +283,48 @@ const HomeView = () => {
         {auth.account ? (
           <div>
             <p>✅ <strong>{auth.account.name}</strong>님으로 로그인됨 (accountId: {auth.account.accountId})</p>
-            <button onClick={handleLogout} style={{ padding: '8px 16px', cursor: 'pointer' }}>로그아웃</button>
+            <button onClick={handleLogout} style={{ padding: '8px 16px', cursor: 'pointer', marginRight: '10px' }}>로그아웃</button>
+            <button onClick={handleLoadHistory} style={{ padding: '8px 16px', cursor: 'pointer', backgroundColor: '#0984e3', color: 'white', border: 'none', borderRadius: '5px' }}>
+              내 발표 기록 보기
+            </button>
+
+            {historyRooms && (
+              <div style={{ marginTop: '15px' }}>
+                {historyRooms.length === 0 ? (
+                  <p style={{ color: '#999' }}>종료된 발표 기록이 없습니다.</p>
+                ) : (
+                  <ul style={{ paddingLeft: '20px' }}>
+                    {historyRooms.map((r) => (
+                      <li key={r.roomId} style={{ marginBottom: '6px' }}>
+                        <button onClick={() => handleLoadHistoryDetail(r.roomId)} style={{ cursor: 'pointer', background: 'none', border: 'none', color: '#0984e3', textDecoration: 'underline', padding: 0, font: 'inherit' }}>
+                          {r.title}
+                        </button>
+                        {' '}— 총 {r.totalTimeSeconds}초, 발표자 {r.totalPresenters}명, 청중 {r.totalAudience}명
+                        {' '}
+                        <button onClick={() => handleReplayFromHistory(r.roomId, r.title)} style={{ cursor: 'pointer', padding: '2px 8px', fontSize: '12px', backgroundColor: '#6c5ce7', color: 'white', border: 'none', borderRadius: '4px' }}>
+                          다시 발표하기
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {historyDetail && (
+              <div style={{ marginTop: '10px', padding: '12px', backgroundColor: '#f8f9fa', borderRadius: '8px' }}>
+                {historyDetail.error ? (
+                  <p style={{ color: '#d63031' }}>❌ {historyDetail.error}</p>
+                ) : (
+                  <>
+                    <p><strong>{historyDetail.title}</strong> (roomId: {historyDetail.roomId})</p>
+                    <p>발표 자료: {historyDetail.fileUrl || '없음'} / 총 발표 시간: {historyDetail.totalTimeSeconds}초</p>
+                    <p>발표자: {historyDetail.presenters.map(p => p.name).join(', ')}</p>
+                    <p>슬라이드 {historyDetail.slides.length}장 / 답변한 질문 {historyDetail.answeredQuestions.length}개</p>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         ) : (
           <div>
@@ -329,6 +458,47 @@ const HomeView = () => {
         )}
       </div>
 
+      <div style={{ margin: '20px auto', padding: '20px', border: '2px dashed #e17055', display: 'inline-block', borderRadius: '10px', textAlign: 'left' }}>
+        <h3 style={{ marginTop: 0 }}>🙋 (다른 탭에서) 발표자 코드로 두 번째 발표자로 참가</h3>
+        <p style={{ fontSize: '13px', color: '#636e72', marginTop: 0 }}>
+          위에서 만든 방의 "발표자 코드"를 다른 브라우저 탭에 붙여넣고 여기로 참가하면, 아래 노트 저장 기능이
+          같은 방의 다른 발표자 사이에 실시간으로 반영되는지 두 탭으로 직접 확인할 수 있습니다.
+        </p>
+        <input placeholder="발표자 코드" value={joinPresenterCode} onChange={(e) => setJoinPresenterCode(e.target.value)} style={{ padding: '8px', marginRight: '8px' }} />
+        <input placeholder="이름" value={joinPresenterName} onChange={(e) => setJoinPresenterName(e.target.value)} style={{ padding: '8px', marginRight: '8px' }} />
+        <button onClick={handleJoinAsPresenter} style={{ padding: '8px 16px', cursor: 'pointer', backgroundColor: '#e17055', color: 'white', border: 'none', borderRadius: '5px' }}>
+          참가하기
+        </button>
+        {joinedPresenterInfo && (
+          <p style={{ marginBottom: 0 }}>
+            ✅ <strong>{joinedPresenterInfo.title}</strong>에 {joinedPresenterInfo.role}로 참가됨 (roomId: {joinedPresenterInfo.roomId})
+            {' — 자료: '}
+            {joinedPresenterInfo.currentFileUrl ? `업로드됨 (${joinedPresenterInfo.slideCount}장, 대본 ${joinedPresenterInfo.hasScript ? '있음' : '없음'})` : '아직 없음'}
+          </p>
+        )}
+      </div>
+
+      {activeRoomId && (
+        <div style={{ margin: '20px auto', padding: '20px', border: '2px dashed #6c5ce7', display: 'inline-block', borderRadius: '10px', textAlign: 'left' }}>
+          <h3 style={{ marginTop: 0 }}>📝 발표자 노트 저장 테스트 (roomId: {activeRoomId})</h3>
+          <div style={{ marginBottom: '10px' }}>
+            <label style={{ marginRight: '10px' }}>슬라이드 번호:</label>
+            <input type="number" min="1" value={noteSlideIndex} onChange={(e) => setNoteSlideIndex(e.target.value)} style={{ width: '50px', padding: '6px', marginRight: '10px' }} />
+            <input placeholder="노트 내용" value={noteText} onChange={(e) => setNoteText(e.target.value)} style={{ padding: '6px', width: '250px', marginRight: '10px' }} />
+            <button onClick={handleSaveNote} style={{ padding: '6px 16px', cursor: 'pointer', backgroundColor: '#6c5ce7', color: 'white', border: 'none', borderRadius: '5px' }}>
+              노트 저장
+            </button>
+            {noteSaveStatus && <span style={{ marginLeft: '10px' }}>{noteSaveStatus}</span>}
+          </div>
+          <div style={{ padding: '10px', backgroundColor: '#f8f9fa', borderRadius: '6px' }}>
+            <strong>실시간으로 받은 note:saved 이벤트:</strong>{' '}
+            {receivedNoteUpdate
+              ? `[슬라이드 #${receivedNoteUpdate.slideIndex}] "${receivedNoteUpdate.newNote}" (${receivedNoteUpdate.editedByName}, ${receivedNoteUpdate.receivedAt})`
+              : '아직 없음'}
+          </div>
+        </div>
+      )}
+
       <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', marginTop: '40px' }}>
         <Link to="/display" target="_blank" style={{ padding: '15px 30px', background: '#343a40', color: 'white', textDecoration: 'none', borderRadius: '8px', fontSize: '18px' }}>
           🖥️ PC 디스플레이 열기
@@ -364,10 +534,20 @@ const DisplayView = () => {
       if (data.userId) localStorage.setItem('kit_userId_display', data.userId);
       // 이미 자료가 업로드돼 있던 방에 들어온 경우(재연결 등) 바로 이미지 목록을 받아온다
       if (data.currentFileUrl) fetchSlideImages(data.roomId, setSlideImages);
+      // [수정] 발표가 이미 진행 중인 방에 (재)접속한 경우, presentation:started는 이미 지나가버려서
+      // 영영 못 받는다. 입장 응답의 status로 직접 판단해서 발표 화면으로 바로 전환한다.
+      if (data.status === 'progress') setIsStarted(true);
     });
     socket.on('presentation:started', (data) => {
       setIsStarted(true);
       if (data?.currentFileUrl) fetchSlideImages(joinedData?.roomId, setSlideImages);
+    });
+    // [신규] 발표 "시작 취소" — 발표 종료(질문 화면 없음, PC는 그런 화면 자체가 없음)와 달리
+    // 시작 전 QR코드 대기 화면으로 되돌아간다. 슬라이드/질문 상태도 리셋.
+    socket.on('presentation:cancelled', () => {
+      setIsStarted(false);
+      setSlideIndex(1);
+      setActiveQuestion(null);
     });
     // [신규] 자료가 업로드되는 순간에도 바로 받아옴(발표 시작 전 미리보기 등)
     socket.on('file:ready', () => {
@@ -377,12 +557,13 @@ const DisplayView = () => {
 
     // ✨ 명세서 동기화: 최신 이벤트명 수신 및 nickname 접근 적용
     socket.on('question:answering_started', (data) => setActiveQuestion(data));
-    socket.on('question:answered_list_update', () => setActiveQuestion(null)); 
+    socket.on('question:answered_list_update', () => setActiveQuestion(null));
     socket.on('error', (err) => alert(err.message));
 
     return () => {
       socket.off('room:joined');
       socket.off('presentation:started');
+      socket.off('presentation:cancelled');
       socket.off('file:ready');
       socket.off('slide:changed');
       socket.off('question:answering_started');
@@ -465,12 +646,16 @@ const AudienceView = () => {
   
   const [questionText, setQuestionText] = useState('');
   const [activeQuestion, setActiveQuestion] = useState(null);
-  const [answeredQuestions, setAnsweredQuestions] = useState([]);
+  // [수정] "답변완료 목록"을 별도로 안 두고, 등록된 질문을 채팅처럼 한 목록(questions)에 전부
+  // 모아두고 각 항목의 status(pending/answering/completed)만 갱신하는 방식으로 바꿨다.
+  const [questions, setQuestions] = useState([]);
   // [신규] "발표 중 질문 허용"이 꺼진 방이면 발표가 끝나기 전까진 등록 버튼을 눌러도 막힘.
   // 서버 검증(alert)에만 맡기지 않고, 버튼 자체를 비활성화해서 스펙대로 동작하게 함.
   const [canAskQuestion, setCanAskQuestion] = useState(true);
   // [신규] { 슬라이드번호: 이미지URL } 형태로 보관
   const [slideImages, setSlideImages] = useState({});
+  // [신규] 질문이 새로 등록될 때마다 채팅처럼 맨 아래로 자동 스크롤하기 위한 앵커
+  const questionsEndRef = useRef(null);
 
   const handleJoin = () => {
     const myUserId = getOrCreateUserId('kit_userId_audience');
@@ -489,6 +674,14 @@ const AudienceView = () => {
       setJoinedData(data);
       if (data.userId) localStorage.setItem('kit_userId_audience', data.userId);
       if (data.currentFileUrl) fetchSlideImages(data.roomId, setSlideImages);
+      // [신규] 새로고침/재접속해도 이미 등록된 질문들이 채팅처럼 다시 보이게 함
+      fetchQuestions(data.roomId, setQuestions);
+      // [수정] 발표가 이미 진행 중인 방에 (QR로 늦게 스캔해서) 들어온 경우, presentation:started는
+      // 이미 지나가버려서 영영 못 받는다. 입장 응답의 status로 직접 판단해서 화면을 전환한다.
+      if (data.status === 'progress') {
+        setIsStarted(true);
+        setCanAskQuestion(!!data.allowMidQuestions);
+      }
     });
     socket.on('presentation:started', (data) => {
       setIsStarted(true);
@@ -496,31 +689,55 @@ const AudienceView = () => {
       setCanAskQuestion(!!data.allowMidQuestions);
       if (data?.currentFileUrl) fetchSlideImages(joinedData?.roomId, setSlideImages);
     });
+    // [신규] 질문 등록 버튼을 눌렀을 때 실제로 화면에 나타나지 않던 버그 — question:new를
+    // 아예 구독하지 않고 있었다. 등록되는 즉시 채팅 목록 맨 아래에 추가한다.
+    socket.on('question:new', (data) => {
+      setQuestions((prev) => [...prev, { ...data, status: 'pending' }]);
+    });
     // [신규] 자료가 업로드되는 순간에도 바로 받아옴 (발표 시작 전부터 청중이 미리 열람 가능)
     socket.on('file:ready', () => {
       if (joinedData?.roomId) fetchSlideImages(joinedData.roomId, setSlideImages);
     });
     // [신규] 발표가 끝나면 설정과 무관하게 항상 질문 가능(서버 로직과 동일한 기준)
     socket.on('presentation:ended', () => setCanAskQuestion(true));
+    // [신규] 발표 "시작 취소" — 발표 종료가 아니라 시작 자체가 취소된 것이므로,
+    // 질문 가능 여부 등을 다시 "발표 시작 대기 중" 초기 상태로 되돌린다.
+    socket.on('presentation:cancelled', () => {
+      setIsStarted(false);
+      setLocalSlideIndex(1);
+      setActiveQuestion(null);
+      setCanAskQuestion(true);
+    });
     socket.on('error', (err) => alert(err.message));
     
     // ✨ 명세서 동기화: 이벤트 수신 리스너 명칭 매핑 완료
-    socket.on('question:answering_started', (data) => setActiveQuestion(data));
+    socket.on('question:answering_started', (data) => {
+      setActiveQuestion(data);
+      setQuestions((prev) => prev.map(q => q.questionId === data.questionId ? { ...q, status: 'answering' } : q));
+    });
     socket.on('question:answered_list_update', (data) => {
       setActiveQuestion(null);
-      setAnsweredQuestions(data.answered);
+      const answeredIds = new Set(data.answered.map(a => a.questionId));
+      setQuestions((prev) => prev.map(q => answeredIds.has(q.questionId) ? { ...q, status: 'completed' } : q));
     });
 
     return () => {
       socket.off('room:joined');
       socket.off('presentation:started');
+      socket.off('question:new');
       socket.off('file:ready');
       socket.off('presentation:ended');
+      socket.off('presentation:cancelled');
       socket.off('error');
       socket.off('question:answering_started');
       socket.off('question:answered_list_update');
     };
   }, [joinedData?.roomId]);
+
+  // [신규] 새 질문이 등록될 때마다 채팅처럼 목록 맨 아래로 자동 스크롤
+  useEffect(() => {
+    questionsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [questions.length]);
 
   if (isStarted) {
     const maxSlide = Object.keys(slideImages).length || null;
@@ -555,56 +772,74 @@ const AudienceView = () => {
         </div>
 
         <div style={{ width: '350px', backgroundColor: 'white', borderLeft: '1px solid #ddd', display: 'flex', flexDirection: 'column' }}>
-          {activeQuestion ? (
-            <div style={{ padding: '20px', backgroundColor: '#fff3cd', borderBottom: '2px solid #ffeeba' }}>
+          {activeQuestion && (
+            <div style={{ padding: '15px 20px', backgroundColor: '#fff3cd', borderBottom: '2px solid #ffeeba' }}>
               <h4 style={{ margin: '0 0 10px 0', color: '#856404' }}>현재 답변 중인 질문</h4>
               <p style={{ margin: 0, fontWeight: 'bold' }}>{activeQuestion.text}</p>
               <small style={{ color: '#6c757d' }}>- {activeQuestion.nickname}</small>
             </div>
-          ) : (
-            <div style={{ padding: '20px', backgroundColor: '#e9ecef', borderBottom: '1px solid #ddd' }}>
-              <h4 style={{ margin: 0, color: '#495057' }}>대기 중인 답변이 없습니다</h4>
-            </div>
           )}
 
-          <div style={{ padding: '20px', borderBottom: '1px solid #ddd' }}>
-            <h4>질문 남기기</h4>
+          {/* [신규] 채팅처럼 등록된 질문이 쌓이는 영역 — 입력창은 이 아래(하단)에 고정 */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '15px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {questions.length === 0 && (
+              <p style={{ color: '#999', textAlign: 'center', marginTop: '20px' }}>아직 등록된 질문이 없습니다.</p>
+            )}
+            {questions.map(q => {
+              const bubbleStyle = q.status === 'answering'
+                ? { backgroundColor: '#fff3cd', border: '1px solid #ffeeba' }
+                : q.status === 'completed'
+                  ? { backgroundColor: '#f1f2f6', border: '1px solid #e2e6ea' }
+                  : { backgroundColor: '#e7f3ff', border: '1px solid #cfe6ff' };
+              return (
+                <div key={q.questionId} style={{ ...bubbleStyle, borderRadius: '14px', padding: '10px 14px', maxWidth: '90%', alignSelf: 'flex-start' }}>
+                  <p style={{ margin: 0, wordBreak: 'break-word' }}>{q.text}</p>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px' }}>
+                    <small style={{ color: '#6c757d' }}>{q.nickname}</small>
+                    {q.status === 'answering' && <small style={{ color: '#856404', fontWeight: 'bold' }}>답변 중</small>}
+                    {q.status === 'completed' && <small style={{ color: '#00b894', fontWeight: 'bold' }}>✓ 답변완료</small>}
+                  </div>
+                </div>
+              );
+            })}
+            <div ref={questionsEndRef} />
+          </div>
+
+          {/* [신규] 입력창을 화면 하단에 고정 */}
+          <div style={{ padding: '15px', borderTop: '1px solid #ddd' }}>
             {!canAskQuestion && (
               <p style={{ margin: '0 0 10px 0', fontSize: '13px', color: '#e17055' }}>
                 발표자가 발표 중 질문을 받지 않도록 설정했어요. 발표가 끝나면 등록할 수 있어요.
               </p>
             )}
-            <textarea 
-              value={questionText} 
-              onChange={(e) => setQuestionText(e.target.value)} 
-              placeholder="궁금한 점을 입력해주세요"
-              disabled={!canAskQuestion}
-              style={{ width: '100%', height: '80px', padding: '10px', boxSizing: 'border-box', resize: 'none', marginBottom: '10px', backgroundColor: canAskQuestion ? 'white' : '#f1f2f6' }}
-            />
-            <button 
-              onClick={handleSubmitQuestion} 
-              disabled={!canAskQuestion || !questionText.trim()}
-              style={{ 
-                width: '100%', padding: '10px', 
-                backgroundColor: canAskQuestion ? '#28A745' : '#b2bec3', 
-                color: 'white', border: 'none', 
-                cursor: canAskQuestion ? 'pointer' : 'not-allowed', 
-                borderRadius: '4px' 
-              }}
-            >
-              등록하기
-            </button>
-          </div>
-
-          <div style={{ flex: 1, overflowY: 'auto', padding: '20px' }}>
-            <h4>답변 완료 목록</h4>
-            {answeredQuestions.length === 0 && <p style={{ color: '#999' }}>아직 답변된 질문이 없습니다.</p>}
-            {answeredQuestions.map(q => (
-              <div key={q.questionId} style={{ marginBottom: '15px', paddingBottom: '15px', borderBottom: '1px dashed #eee' }}>
-                <p style={{ margin: '0 0 5px 0' }}>{q.text}</p>
-                <small style={{ color: '#007BFF' }}>{q.nickname}</small>
-              </div>
-            ))}
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <textarea
+                value={questionText}
+                onChange={(e) => setQuestionText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSubmitQuestion();
+                  }
+                }}
+                placeholder="궁금한 점을 입력해주세요"
+                disabled={!canAskQuestion}
+                style={{ flex: 1, height: '44px', padding: '10px', boxSizing: 'border-box', resize: 'none', backgroundColor: canAskQuestion ? 'white' : '#f1f2f6', borderRadius: '8px', border: '1px solid #ddd' }}
+              />
+              <button
+                onClick={handleSubmitQuestion}
+                disabled={!canAskQuestion || !questionText.trim()}
+                style={{
+                  padding: '0 16px',
+                  backgroundColor: canAskQuestion ? '#28A745' : '#b2bec3',
+                  color: 'white', border: 'none',
+                  cursor: canAskQuestion ? 'pointer' : 'not-allowed',
+                  borderRadius: '8px'
+                }}
+              >
+                등록
+              </button>
+            </div>
           </div>
         </div>
       </div>

@@ -32,6 +32,7 @@ db.exec(`
     -- 발표 진행 상태
     file_url TEXT,                                  -- 발표 자료 URL
     script_url TEXT,                                -- 발표 대본 URL
+    has_script INTEGER DEFAULT 0,                   -- 대본 업로드 여부 (방 단위 서버 상태 — 클라이언트가 알아서 판단하지 않게 함)
     status TEXT DEFAULT 'wait',                     -- 'wait'(대기) -> 'progress'(발표중) -> 'end'(종료)
     current_presenter_id TEXT,                      -- 현재 슬라이드 제어권을 가진 발표자의 고정 user_id
 
@@ -101,6 +102,12 @@ try {
 
 try {
   db.exec(`ALTER TABLE slides ADD COLUMN image_url TEXT`);
+} catch (e) {
+  // 이미 컬럼이 있으면(신규 DB) 무시
+}
+
+try {
+  db.exec(`ALTER TABLE rooms ADD COLUMN has_script INTEGER DEFAULT 0`);
 } catch (e) {
   // 이미 컬럼이 있으면(신규 DB) 무시
 }
