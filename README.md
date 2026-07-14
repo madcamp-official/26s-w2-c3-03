@@ -22,8 +22,8 @@
 
 | 이름 | 학교 | GitHub | 역할 |
 |---|---|---|---|
-| 김민 | 이화여자대학교 |  |  |
-| 김규민 | KAIST |  |  |
+| 김민 | 이화여자대학교 | https://github.com/7immin | 백 |
+| 김규민 | KAIST | https://github.com/rbalskim | 프론트 |
 
 ---
 
@@ -104,8 +104,8 @@
 | 날짜 | 목표 |
 |---|---|
 | Day 1 | 주제 선정 |
-| Day 2 |  |
-| Day 3 |  |
+| Day 2 | 기획안 초안 작성, 역할 분담, DB 스키마 초안 작성, Expo 앱 연결 |
+| Day 3 | 발표 준비 앱 UI 설계, ERD 설계, PC 및 청중 입장 기능 구현 |
 | Day 4 |  |
 | Day 5 |  |
 | Day 6 |  |
@@ -141,6 +141,7 @@
 ### 데이터 구조
 
 <!-- DB 스키마, JSON 구조, 파일 저장 방식 등 -->
+<img width="818" height="760" alt="Image" src="https://github.com/user-attachments/assets/8ab39eee-ba74-424a-952b-76321501abe1" />
 
 ### API / 외부 서비스 연동
 

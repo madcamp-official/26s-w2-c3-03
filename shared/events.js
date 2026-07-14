@@ -130,6 +130,15 @@ const EVENTS = {
   NOTE_SAVED: 'note:saved',
   // payload: { slideIndex: number, editedByName: string }
 
+  NOTES_READY: 'notes:ready',
+  // payload: {
+  //   slideNotes: Array<{ slideIndex: number, text: string }>,
+  //   source: 'auto_split' | 'ai_summarize' | 'ai_generate' | 'manual'
+  // }
+
+  NOTE_SAVED: 'note:saved',
+  // payload: { slideIndex: number, editedByName: string }
+
 
   // ══════════════════════════════════════════════
   // 질문 시스템
