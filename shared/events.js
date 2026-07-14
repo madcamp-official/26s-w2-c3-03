@@ -161,6 +161,7 @@ const EVENTS = {
   // ※ [수정] category는 더 이상 클라이언트가 정하지 않음. 클라이언트를 신뢰하면
   //   항상 같은 값(예: 'during')만 보내는 등 신뢰할 수 없어서, 서버가 room.status로
   //   'during'(진행중) | 'after'(종료 후)를 직접 판단해 저장한다.
+  // ※ [수정] role이 'audience'가 아니면 에러 응답 — 청중 전용 이벤트
 
   QUESTION_NEW: 'question:new',
   // payload: { questionId: string, text: string, nickname: string, category: 'during' | 'after', createdAt: number }
@@ -170,6 +171,7 @@ const EVENTS = {
   QUESTION_ANSWERING_START: 'question:answering_start',
   // payload: { questionId: string }
   // ※ 서버는 현재 answeringPresenterId가 null인지 검증. 이미 다른 사람이 답변 중이면 에러 응답
+  // ※ [수정] 대상 질문이 이미 status='completed'(답변 완료)면 다시 answering으로 못 돌림 — 에러 응답
 
   // [신규] 서버 → 모든 발표자 앱 + PC웹 + 청중웹: 답변 시작 브로드캐스트
   QUESTION_ANSWERING_STARTED: 'question:answering_started',

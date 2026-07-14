@@ -563,9 +563,12 @@ app.get('/rooms/:roomId/slides', (req, res) => {
 
 app.get('/rooms/:roomId/questions', (req, res) => {
   const { roomId } = req.params;
+  // [수정] 예전엔 상태와 무관하게 created_at(등록 순서)로만 정렬해서, 이걸로 "답변한 질문 목록"을
+  // 복구하면(재연결 등) 실시간 소켓(question:answered_list_update, completed_at 기준)과
+  // 순서가 달라졌음. completed 항목은 completed_at, 나머지는 created_at 기준으로 맞춘다.
   const questions = db.prepare(`
     SELECT question_id as questionId, content as text, author_name as nickname, status, created_at as createdAt, selected_at as answeredAt, completed_at as completedAt
-    FROM questions WHERE room_id = ? ORDER BY created_at DESC
+    FROM questions WHERE room_id = ? ORDER BY COALESCE(completed_at, created_at) DESC
   `).all(roomId);
 
   const formattedQuestions = questions.map(q => ({
@@ -739,12 +742,18 @@ io.on('connection', (socket) => {
   });
 
   socket.on(EVENTS.PRESENTATION_START, (payload) => {
+    // [수정] 아래 두 가드가 조용히 return만 해서, 실패해도 클라이언트가 아무 반응도 못 받았음.
+    // (재연결하면서 userId를 다시 안 보냈거나, 방 상태가 이미 바뀐 경우 등) 원인을 알 수 있게 에러를 emit한다.
     const user = db.prepare('SELECT user_id, room_id FROM users WHERE socket_id = ?').get(socket.id);
-    if (!user) return;
+    if (!user) {
+      return socket.emit('error', { message: '서버가 이 연결의 신원을 찾지 못했습니다. 방을 다시 만들거나 재입장해 주세요.' });
+    }
 
     // [수정] 같은 userId가 재사용된 다른 방과 충돌하지 않도록 room_id까지 같이 검증
     const room = db.prepare('SELECT * FROM rooms WHERE room_id = ? AND host_user_id = ? AND status = ?').get(user.room_id, user.user_id, 'wait');
-    if (!room) return;
+    if (!room) {
+      return socket.emit('error', { message: '발표를 시작할 수 없습니다. 방장 권한이 없거나, 이미 시작/종료된 방이거나, 재연결로 신원이 바뀌었을 수 있습니다.' });
+    }
 
     const startedAt = Date.now();
     const durationSeconds = payload.durationMinutes * 60;
@@ -865,6 +874,11 @@ io.on('connection', (socket) => {
     const user = db.prepare('SELECT * FROM users WHERE socket_id = ?').get(socket.id);
     if (!user) return;
 
+    // [수정] 질문 등록은 청중 전용. role 체크가 없어서 PC(display)나 발표자 소켓도 등록할 수 있었음.
+    if (user.role !== 'audience') {
+      return socket.emit('error', { message: '질문 등록은 청중만 가능합니다.' });
+    }
+
     const room = db.prepare('SELECT status, allow_mid_questions, is_anonymous FROM rooms WHERE room_id = ?').get(user.room_id);
     if (!room) return;
 
@@ -894,12 +908,22 @@ io.on('connection', (socket) => {
     if (!user || (user.role !== 'presenter' && user.role !== 'host')) return;
 
     const isAnswering = db.prepare("SELECT * FROM questions WHERE room_id = ? AND status = 'answering'").get(user.room_id);
-    if (isAnswering) return;
+    if (isAnswering) {
+      // [수정] 예전엔 조용히 무시해서, 타이밍이 어긋나 버튼이 아직 안 꺼진 상태로 눌렀을 때
+      // 누른 사람에게 아무 피드백이 없었음. 정상 플로우(버튼 비활성화)에서는 안 뜨는 게 맞고,
+      // 어긋난 경우에만 보이는 안전망 성격의 에러.
+      return socket.emit('error', { message: '다른 발표자가 이미 답변 중입니다.' });
+    }
 
     // [수정] question_id는 방을 통틀어 전역으로 증가하는 값이라, room_id 조건이 없으면
     // 다른 방의 questionId를 넣었을 때 그 방의 질문이 이 방으로 새어나올 수 있었음.
     const q = db.prepare("SELECT * FROM questions WHERE question_id = ? AND room_id = ?").get(questionId, user.room_id);
     if (!q) return;
+
+    // [수정] 이미 답변 완료된 질문을 다시 답변 중 상태로 되돌릴 수 없게 막는다.
+    if (q.status === 'completed') {
+      return socket.emit('error', { message: '이미 답변 완료된 질문입니다.' });
+    }
 
     db.prepare("UPDATE questions SET status = 'answering', selected_at = ?, answering_presenter_id = ? WHERE question_id = ?")
       .run(Date.now(), user.user_id, questionId);
