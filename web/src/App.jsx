@@ -207,7 +207,7 @@ const HomeView = () => {
               <input placeholder="이름" value={authName} onChange={(e) => setAuthName(e.target.value)} style={{ padding: '8px', marginRight: '8px', marginBottom: '8px' }} />
             )}
             <input placeholder="이메일" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} style={{ padding: '8px', marginRight: '8px', marginBottom: '8px' }} />
-            <input type="password" placeholder="비밀번호 (6자 이상)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} style={{ padding: '8px', marginRight: '8px', marginBottom: '8px' }} />
+            <input type="password" placeholder="비밀번호 (영문/숫자/특수문자 포함 8~12자)" maxLength={12} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} style={{ padding: '8px', marginRight: '8px', marginBottom: '8px' }} />
             <button onClick={handleAuthSubmit} style={{ padding: '8px 16px', cursor: 'pointer', backgroundColor: '#00b894', color: 'white', border: 'none', borderRadius: '5px' }}>
               {authMode === 'signup' ? '가입하기' : '로그인'}
             </button>

@@ -140,12 +140,16 @@ const EVENTS = {
 
   NOTES_READY: 'notes:ready',
   // payload: {
-  //   slideNotes: Array<{ slideIndex: number, text: string }>,
+  //   slideNotes: Array<{ slideIndex: number, text: string, imageUrl: string | null }>,
   //   source: 'auto_split' | 'ai_summarize' | 'ai_generate' | 'manual'
   // }
+  // ※ [수정] imageUrl 추가. 노트 수정 화면이 이 이벤트만으로 텍스트+슬라이드 이미지를
+  //   같이 그릴 수 있도록(별도로 GET /rooms/:roomId/slides를 다시 호출할 필요 없게) 함.
 
   NOTE_SAVED: 'note:saved',
-  // payload: { slideIndex: number, editedByName: string }
+  // payload: { slideIndex: number, editedByName: string, newNote: string, imageUrl: string | null }
+  // ※ [수정] newNote/imageUrl 추가. 다른 발표자 화면이 이 이벤트만으로 수정된 노트 내용과
+  //   해당 슬라이드 이미지를 그대로 반영할 수 있게 함.
 
 
   // ══════════════════════════════════════════════

@@ -155,14 +155,21 @@ async function callAiApiWithRetry(prompt, options = {}) {
 // =========================================================================
 
 // 0-1. 회원가입
+// 영문/숫자/특수문자를 각각 최소 1개 이상 포함한 8~12자
+const PASSWORD_REGEX = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,12}$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 app.post('/auth/signup', async (req, res) => {
   const { email, password, name } = req.body;
 
   if (!email || !password || !name) {
     return res.status(400).json({ success: false, message: '이메일, 비밀번호, 이름은 필수입니다.' });
   }
-  if (password.length < 6) {
-    return res.status(400).json({ success: false, message: '비밀번호는 6자 이상이어야 합니다.' });
+  if (!EMAIL_REGEX.test(email)) {
+    return res.status(400).json({ success: false, message: '이메일 형식이 올바르지 않습니다.' });
+  }
+  if (!PASSWORD_REGEX.test(password)) {
+    return res.status(400).json({ success: false, message: '비밀번호는 영문, 숫자, 특수문자를 모두 포함한 8~12자여야 합니다.' });
   }
 
   try {
@@ -401,12 +408,18 @@ app.post('/rooms/:roomId/script', upload.single('scriptFile'), async (req, res) 
     updateNotes();
     console.log(`[DEBUG: /script] DB 대본 UPDATE 완료`);
 
-    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes, source: 'ai_context_split' });
+    // [수정] slideNotes에 imageUrl이 없어서, 이 이벤트/응답만 보고 노트 수정 화면을 그리면
+    // 슬라이드 이미지 없이 텍스트만 나오는 문제가 있었음. DB에 이미 저장된 image_url을 붙여준다.
+    const imageRows = db.prepare('SELECT slide_index, image_url FROM slides WHERE room_id = ?').all(roomId);
+    const imageUrlBySlideIndex = Object.fromEntries(imageRows.map(r => [r.slide_index, r.image_url]));
+    const slideNotesWithImages = slideNotes.map(note => ({ ...note, imageUrl: imageUrlBySlideIndex[note.slideIndex] || null }));
+
+    io.to(roomId).emit(EVENTS.NOTES_READY, { slideNotes: slideNotesWithImages, source: 'ai_context_split' });
     console.log(`[DEBUG: /script] 프론트엔드로 소켓 이벤트(NOTES_READY) 방출 완료`);
-    
+
     // DB에서 가져온 정확한 slideCount를 프론트엔드에 응답합니다.
     // slideNotes도 같이 실어서, 소켓 재연결로 NOTES_READY를 놓쳐도 REST 응답만으로 화면을 갱신할 수 있게 함.
-    const responsePayload = { success: true, message: '대본 AI 매칭 완료', slideCount: slideCount, hasScript: true, slideNotes }
+    const responsePayload = { success: true, message: '대본 AI 매칭 완료', slideCount: slideCount, hasScript: true, slideNotes: slideNotesWithImages }
     res.json(responsePayload);
     console.log(`[DEBUG: /script] 프론트엔드로 응답 전송:`, responsePayload);
 
@@ -467,7 +480,8 @@ app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
       });
       
       updateStmt.run(aiSummary, slide.slide_id);
-      return { slideIndex: slide.slide_index, text: aiSummary };
+      // [수정] imageUrl도 같이 실어서, 이 응답/이벤트만으로 노트 수정 화면에 슬라이드 이미지까지 바로 그릴 수 있게 함
+      return { slideIndex: slide.slide_index, text: aiSummary, imageUrl: slide.image_url || null };
     });
 
     const resolvedAiNotes = await Promise.all(aiPromises);
@@ -488,7 +502,9 @@ app.put('/rooms/:roomId/slides/:slideIndex/note', (req, res) => {
   const { roomId, slideIndex } = req.params;
   const { newNote, editedByName } = req.body;
   db.prepare('UPDATE slides SET ai_summary_note = ? WHERE room_id = ? AND slide_index = ?').run(newNote, roomId, slideIndex);
-  io.to(roomId).emit(EVENTS.NOTE_SAVED, { slideIndex: parseInt(slideIndex, 10), editedByName });
+  // [수정] imageUrl도 같이 보내서, 이 이벤트만 받는 다른 발표자 화면도 별도 조회 없이 이미지를 유지/표시할 수 있게 함
+  const slide = db.prepare('SELECT image_url FROM slides WHERE room_id = ? AND slide_index = ?').get(roomId, slideIndex);
+  io.to(roomId).emit(EVENTS.NOTE_SAVED, { slideIndex: parseInt(slideIndex, 10), editedByName, newNote, imageUrl: slide?.image_url || null });
   res.json({ success: true });
 });
 
