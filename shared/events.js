@@ -11,36 +11,48 @@
 //   권한은 전부 "현재 currentPresenterId인가"로 통일해서 검증. 발표자 교체는 발표 시작 이후
 //   (리모컨 화면)에서만 발생하므로, 설정 변경 시점(대기화면)엔 항상 방 생성자 = 현재 발표자
 // ※ 노트 저장/AI 처리는 실시간성이 없어 REST API로 처리 (하단 별도 명시)
+// ※ [신규] 아래 두 REST GET API는 소켓 이벤트를 놓쳤을 때(재연결, 늦은 입장 등) 상태를
+//   다시 조회하기 위한 용도. 소켓 이벤트가 아니라 서버 index.js에 직접 구현되어 있음.
+//   - GET /rooms/:roomId        → 방 현재 상태(진행 상태, 현재 발표자, 설정값, 현재 슬라이드 등)
+//   - GET /rooms/:roomId/slides → 슬라이드별 원본 대본 + AI 노트 목록 (미리보기 화면용)
 
 const EVENTS = {
   // ══════════════════════════════════════════════
   // 룸 생성 & 코드 발급
   // ══════════════════════════════════════════════
 
+  // ※ [신규] 4개 이벤트 모두 payload에 optional userId를 추가함.
+  //   클라이언트(모바일 앱/웹)는 최초 접속 시 userId를 로컬에 저장해두고(기기 UUID 등),
+  //   재연결할 때마다 같은 값을 실어보내야 한다. 서버는 이 값이 있으면 그대로 신원으로 인정하고
+  //   socket_id만 최신으로 갱신한다 — 없으면(첫 실행) 서버가 새로 발급해서 응답으로 돌려준다.
+  //   이렇게 해야 소켓이 끊겼다 재연결돼도 발표 제어권(current_presenter_id 등)을 잃지 않는다.
+
   ROOM_CREATE: 'room:create',
-  // payload: { title: string }  // 제목 입력 필수
+  // payload: { title: string, name?: string, userId?: string }  // 제목 입력 필수
 
   ROOM_CREATED: 'room:created',
-  // payload: { roomId: string, title: string, displayCode: string, audienceCode: string, presenterCode: string }
+  // payload: { roomId: string, title: string, displayCode: string, audienceCode: string, presenterCode: string, userId: string }
 
   ROOM_JOIN_PRESENTER: 'room:join_presenter',
-  // payload: { roomId: string, presenterCode: string, name: string }
+  // payload: { roomId: string, presenterCode: string, name: string, userId?: string }
+  // ※ role은 서버가 (전달된) userId === room.host_user_id 여부로 판단해서 'host' | 'presenter'로 응답한다.
 
   ROOM_JOIN_DISPLAY: 'room:join_display',
-  // payload: { displayCode: string }
+  // payload: { displayCode: string, userId?: string }
 
   // 청중 웹 → 서버: 입장. name은 기명 모드에서만 사용, 익명 모드면 서버가 자동 생성
   ROOM_JOIN_AUDIENCE: 'room:join_audience',
-  // payload: { audienceCode: string, name?: string }
+  // payload: { audienceCode: string, name?: string, userId?: string }
 
   ROOM_JOINED: 'room:joined',
   // payload: {
   //   roomId: string,
-  //   role: 'presenter' | 'display' | 'audience',
+  //   role: 'host' | 'presenter' | 'display' | 'audience',
   //   userId: string,
   //   nickname: string | null,
   //   currentFileUrl: string | null
   // }
+  // ※ 클라이언트는 여기서 받은 userId를 로컬에 저장해서 다음 재연결에 그대로 재사용해야 함.
 
   // 서버 → 모든 발표자 앱: 발표자 목록 (배열 길이 = 발표자 인원수)
   PRESENTER_LIST_UPDATE: 'presenter:list_update',
@@ -119,7 +131,9 @@ const EVENTS = {
   // ══════════════════════════════════════════════
 
   FILE_READY: 'file:ready',
-  // payload: { fileId: string, ownerId: string, slideCount: number }
+  // payload: { fileId: string, ownerId: string, slideCount: number, fileUrl: string }
+  // ※ [수정] fileUrl 추가. 업로드 이전부터 방에 있던 다른 발표자는 이 이벤트 전까지
+  //   파일 URL을 받을 방법이 없었기 때문(그전엔 slideCount만 왔음).
 
   NOTES_READY: 'notes:ready',
   // payload: {
@@ -136,7 +150,10 @@ const EVENTS = {
   // ══════════════════════════════════════════════
 
   QUESTION_SUBMIT: 'question:submit',
-  // payload: { text: string, category: 'during' | 'after' }
+  // payload: { text: string }
+  // ※ [수정] category는 더 이상 클라이언트가 정하지 않음. 클라이언트를 신뢰하면
+  //   항상 같은 값(예: 'during')만 보내는 등 신뢰할 수 없어서, 서버가 room.status로
+  //   'during'(진행중) | 'after'(종료 후)를 직접 판단해 저장한다.
 
   QUESTION_NEW: 'question:new',
   // payload: { questionId: string, text: string, nickname: string, category: 'during' | 'after', createdAt: number }

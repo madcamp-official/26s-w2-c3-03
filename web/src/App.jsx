@@ -6,6 +6,36 @@ import { QRCodeSVG } from 'qrcode.react';
 
 const socket = io(`http://${window.location.hostname}:4000`);
 
+// [신규] 재연결해도 같은 사람으로 인식되도록, 역할별로 고정 userId를 localStorage에 보관해두고
+// 매번 join/create 이벤트에 실어보낸다. (서버가 이 값을 신원으로 그대로 신뢰함 — events.js 참고)
+const getOrCreateUserId = (storageKey) => {
+  let id = localStorage.getItem(storageKey);
+  if (!id) {
+    id = 'usr_' + Math.random().toString(36).substring(2, 10);
+    localStorage.setItem(storageKey, id);
+  }
+  return id;
+};
+
+const API_BASE = `http://${window.location.hostname}:4000`;
+
+// [신규] 서버가 PDF를 페이지별 PNG로 변환해 저장해두므로, 슬라이드 목록(이미지 URL 포함)을
+// REST로 받아와 슬라이드 번호 → 이미지 URL 맵으로 만들어둔다.
+const fetchSlideImages = async (roomId, setSlideImages) => {
+  try {
+    const res = await fetch(`${API_BASE}/rooms/${roomId}/slides`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const map = {};
+    (data.slides || []).forEach(s => {
+      if (s.imageUrl) map[s.slideIndex] = `${API_BASE}${s.imageUrl}`;
+    });
+    setSlideImages(map);
+  } catch (e) {
+    console.error('슬라이드 이미지 목록을 불러오지 못했습니다.', e);
+  }
+};
+
 // =========================================================================
 // [화면 0] 임시 발표자 앱 리모컨 (HomeView) - 테스트용
 // =========================================================================
@@ -16,7 +46,12 @@ const HomeView = () => {
 
   const [durationMinutes, setDurationMinutes] = useState(1);
   const [anonymous, setAnonymous] = useState(true); // ✨ 명세서 동기화: Boolean 타입 설정 변경
-  const [allowMidQuestions, setAllowMidQuestions] = useState(true); 
+  const [allowMidQuestions, setAllowMidQuestions] = useState(true);
+
+  // [테스트용] PDF → PNG 변환 기능 확인용 업로드 상태
+  const [presentationFile, setPresentationFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
 
   useEffect(() => {
     socket.on('timer:update', (data) => setTimerData(data));
@@ -28,8 +63,12 @@ const HomeView = () => {
   }, []);
 
   const handleTestCreateRoom = () => {
-    socket.emit('room:create', { title: roomTitle });
-    socket.once('room:created', (data) => setTestRoomInfo(data));
+    const myUserId = getOrCreateUserId('kit_userId_host');
+    socket.emit('room:create', { title: roomTitle, userId: myUserId });
+    socket.once('room:created', (data) => {
+      setTestRoomInfo(data);
+      if (data.userId) localStorage.setItem('kit_userId_host', data.userId);
+    });
   };
 
   const handleStart = () => {
@@ -41,6 +80,30 @@ const HomeView = () => {
   };
   const handleNextSlide = () => socket.emit('slide:next');
   const handlePrevSlide = () => socket.emit('slide:prev');
+
+  // [테스트용] 발표 자료(PDF) 업로드 → 서버가 PNG로 변환한 결과를 그대로 받아와 화면에 보여줌
+  const handleUploadPresentation = async () => {
+    if (!presentationFile || !testRoomInfo) return;
+    setUploading(true);
+    setUploadResult(null);
+    try {
+      const formData = new FormData();
+      formData.append('presentationFile', presentationFile);
+      formData.append('ownerId', localStorage.getItem('kit_userId_host') || '');
+
+      const res = await fetch(`${API_BASE}/rooms/${testRoomInfo.roomId}/presentation`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      setUploadResult(data);
+      if (!data.success) alert(`업로드 실패: ${data.message}`);
+    } catch (e) {
+      alert(`업로드 중 오류: ${e.message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
 
   const formatTime = (seconds) => {
     const m = Math.floor(seconds / 60).toString().padStart(2, '0');
@@ -102,6 +165,47 @@ const HomeView = () => {
               </div>
             </div>
 
+            <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#a29bfe', borderRadius: '8px', textAlign: 'center' }}>
+              <h4 style={{ margin: '0 0 10px 0' }}>🖼️ 발표 자료(PDF) 업로드 → PNG 변환 테스트</h4>
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(e) => setPresentationFile(e.target.files[0] || null)}
+                style={{ marginRight: '10px' }}
+              />
+              <button
+                onClick={handleUploadPresentation}
+                disabled={!presentationFile || uploading}
+                style={{ padding: '8px 20px', cursor: presentationFile && !uploading ? 'pointer' : 'not-allowed', backgroundColor: '#6c5ce7', color: 'white', border: 'none', borderRadius: '5px' }}
+              >
+                {uploading ? '변환 중...' : '업로드 및 변환'}
+              </button>
+
+              {uploadResult && (
+                <div style={{ marginTop: '15px', textAlign: 'left' }}>
+                  {uploadResult.success ? (
+                    <>
+                      <p><strong>✅ 변환 완료:</strong> 총 {uploadResult.slideCount}장</p>
+                      <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', backgroundColor: 'white', padding: '10px', borderRadius: '8px' }}>
+                        {(uploadResult.images || []).map(img => (
+                          <div key={img.slideIndex} style={{ textAlign: 'center' }}>
+                            <img
+                              src={`${API_BASE}${img.imageUrl}`}
+                              alt={`슬라이드 ${img.slideIndex}`}
+                              style={{ width: '160px', border: '1px solid #ddd', borderRadius: '4px' }}
+                            />
+                            <div style={{ fontSize: '12px', color: '#636e72' }}>#{img.slideIndex}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <p style={{ color: '#d63031' }}>❌ {uploadResult.message}</p>
+                  )}
+                </div>
+              )}
+            </div>
+
             <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#eccc68', borderRadius: '8px', textAlign: 'center' }}>
               <h4>📱 (임시) 발표자 앱 리모컨</h4>
               <button onClick={handleStart} style={{ margin: '5px', padding: '8px', cursor: 'pointer', backgroundColor: '#d63031', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 'bold' }}>
@@ -146,14 +250,29 @@ const DisplayView = () => {
   const [isStarted, setIsStarted] = useState(false);
   const [slideIndex, setSlideIndex] = useState(1);
   const [activeQuestion, setActiveQuestion] = useState(null);
+  // [신규] { 슬라이드번호: 이미지URL } 형태로 보관
+  const [slideImages, setSlideImages] = useState({});
 
   const handleJoin = () => {
-    socket.emit('room:join_display', { displayCode: code });
+    const myUserId = getOrCreateUserId('kit_userId_display');
+    socket.emit('room:join_display', { displayCode: code, userId: myUserId });
   };
 
   useEffect(() => {
-    socket.on('room:joined', (data) => setJoinedData(data));
-    socket.on('presentation:started', () => setIsStarted(true));
+    socket.on('room:joined', (data) => {
+      setJoinedData(data);
+      if (data.userId) localStorage.setItem('kit_userId_display', data.userId);
+      // 이미 자료가 업로드돼 있던 방에 들어온 경우(재연결 등) 바로 이미지 목록을 받아온다
+      if (data.currentFileUrl) fetchSlideImages(data.roomId, setSlideImages);
+    });
+    socket.on('presentation:started', (data) => {
+      setIsStarted(true);
+      if (data?.currentFileUrl) fetchSlideImages(joinedData?.roomId, setSlideImages);
+    });
+    // [신규] 자료가 업로드되는 순간에도 바로 받아옴(발표 시작 전 미리보기 등)
+    socket.on('file:ready', () => {
+      if (joinedData?.roomId) fetchSlideImages(joinedData.roomId, setSlideImages);
+    });
     socket.on('slide:changed', (data) => setSlideIndex(data.slideIndex));
 
     // ✨ 명세서 동기화: 최신 이벤트명 수신 및 nickname 접근 적용
@@ -164,22 +283,32 @@ const DisplayView = () => {
     return () => {
       socket.off('room:joined');
       socket.off('presentation:started');
+      socket.off('file:ready');
       socket.off('slide:changed');
       socket.off('question:answering_started');
       socket.off('question:answered_list_update');
       socket.off('error');
     };
-  }, []);
+  }, [joinedData?.roomId]);
 
   if (isStarted) {
+    const currentImageUrl = slideImages[slideIndex];
     return (
       <div style={{ padding: '20px', height: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: '#f1f2f6', position: 'relative' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
           <h2>{joinedData?.title || '발표 진행 중'} - 슬라이드 #{slideIndex}</h2>
         </div>
         
-        <div style={{ flex: 1, backgroundColor: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '48px', border: '2px solid #dfe6e9', borderRadius: '12px' }}>
-          발표 자료 (Slide {slideIndex}) 화면
+        <div style={{ flex: 1, backgroundColor: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '2px solid #dfe6e9', borderRadius: '12px', overflow: 'hidden' }}>
+          {currentImageUrl ? (
+            <img 
+              src={currentImageUrl} 
+              alt={`슬라이드 ${slideIndex}`} 
+              style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} 
+            />
+          ) : (
+            <span style={{ fontSize: '32px', color: '#b2bec3' }}>슬라이드 이미지를 불러오는 중...</span>
+          )}
         </div>
 
         {activeQuestion && (
@@ -237,20 +366,42 @@ const AudienceView = () => {
   const [questionText, setQuestionText] = useState('');
   const [activeQuestion, setActiveQuestion] = useState(null);
   const [answeredQuestions, setAnsweredQuestions] = useState([]);
+  // [신규] "발표 중 질문 허용"이 꺼진 방이면 발표가 끝나기 전까진 등록 버튼을 눌러도 막힘.
+  // 서버 검증(alert)에만 맡기지 않고, 버튼 자체를 비활성화해서 스펙대로 동작하게 함.
+  const [canAskQuestion, setCanAskQuestion] = useState(true);
+  // [신규] { 슬라이드번호: 이미지URL } 형태로 보관
+  const [slideImages, setSlideImages] = useState({});
 
   const handleJoin = () => {
-    socket.emit('room:join_audience', { audienceCode: code, name });
+    const myUserId = getOrCreateUserId('kit_userId_audience');
+    socket.emit('room:join_audience', { audienceCode: code, name, userId: myUserId });
   };
 
   const handleSubmitQuestion = () => {
-    if (!questionText.trim()) return;
-    socket.emit('question:submit', { text: questionText, category: 'during' });
+    if (!questionText.trim() || !canAskQuestion) return;
+    // [수정] category는 서버가 room.status로 직접 판단하므로 더 이상 클라이언트가 보낼 필요 없음
+    socket.emit('question:submit', { text: questionText });
     setQuestionText('');
   };
 
   useEffect(() => {
-    socket.on('room:joined', (data) => setJoinedData(data)); 
-    socket.on('presentation:started', () => setIsStarted(true));
+    socket.on('room:joined', (data) => {
+      setJoinedData(data);
+      if (data.userId) localStorage.setItem('kit_userId_audience', data.userId);
+      if (data.currentFileUrl) fetchSlideImages(data.roomId, setSlideImages);
+    });
+    socket.on('presentation:started', (data) => {
+      setIsStarted(true);
+      // [신규] 발표 시작 시 확정된 설정값으로 질문 등록 가능 여부를 정함
+      setCanAskQuestion(!!data.allowMidQuestions);
+      if (data?.currentFileUrl) fetchSlideImages(joinedData?.roomId, setSlideImages);
+    });
+    // [신규] 자료가 업로드되는 순간에도 바로 받아옴 (발표 시작 전부터 청중이 미리 열람 가능)
+    socket.on('file:ready', () => {
+      if (joinedData?.roomId) fetchSlideImages(joinedData.roomId, setSlideImages);
+    });
+    // [신규] 발표가 끝나면 설정과 무관하게 항상 질문 가능(서버 로직과 동일한 기준)
+    socket.on('presentation:ended', () => setCanAskQuestion(true));
     socket.on('error', (err) => alert(err.message));
     
     // ✨ 명세서 동기화: 이벤트 수신 리스너 명칭 매핑 완료
@@ -263,13 +414,17 @@ const AudienceView = () => {
     return () => {
       socket.off('room:joined');
       socket.off('presentation:started');
+      socket.off('file:ready');
+      socket.off('presentation:ended');
       socket.off('error');
       socket.off('question:answering_started');
       socket.off('question:answered_list_update');
     };
-  }, []);
+  }, [joinedData?.roomId]);
 
   if (isStarted) {
+    const maxSlide = Object.keys(slideImages).length || null;
+    const currentImageUrl = slideImages[localSlideIndex];
     return (
       <div style={{ display: 'flex', height: '100vh', backgroundColor: '#f1f2f6' }}>
         <div style={{ flex: 1, padding: '20px', display: 'flex', flexDirection: 'column' }}>
@@ -278,11 +433,24 @@ const AudienceView = () => {
             <div>
               <button onClick={() => setLocalSlideIndex(prev => Math.max(1, prev - 1))} style={{ padding: '8px 15px', marginRight: '5px' }}>이전</button>
               <span>Slide {localSlideIndex}</span>
-              <button onClick={() => setLocalSlideIndex(prev => prev + 1)} style={{ padding: '8px 15px', marginLeft: '5px' }}>다음</button>
+              <button
+                onClick={() => setLocalSlideIndex(prev => maxSlide ? Math.min(maxSlide, prev + 1) : prev + 1)}
+                style={{ padding: '8px 15px', marginLeft: '5px' }}
+              >
+                다음
+              </button>
             </div>
           </div>
-          <div style={{ flex: 1, backgroundColor: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '32px', borderRadius: '12px', border: '1px solid #ddd' }}>
-            자유 열람 슬라이드 #{localSlideIndex} 화면
+          <div style={{ flex: 1, backgroundColor: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '12px', border: '1px solid #ddd', overflow: 'hidden' }}>
+            {currentImageUrl ? (
+              <img 
+                src={currentImageUrl} 
+                alt={`슬라이드 ${localSlideIndex}`} 
+                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} 
+              />
+            ) : (
+              <span style={{ fontSize: '24px', color: '#b2bec3' }}>슬라이드 이미지를 불러오는 중...</span>
+            )}
           </div>
         </div>
 
@@ -301,13 +469,29 @@ const AudienceView = () => {
 
           <div style={{ padding: '20px', borderBottom: '1px solid #ddd' }}>
             <h4>질문 남기기</h4>
+            {!canAskQuestion && (
+              <p style={{ margin: '0 0 10px 0', fontSize: '13px', color: '#e17055' }}>
+                발표자가 발표 중 질문을 받지 않도록 설정했어요. 발표가 끝나면 등록할 수 있어요.
+              </p>
+            )}
             <textarea 
               value={questionText} 
               onChange={(e) => setQuestionText(e.target.value)} 
               placeholder="궁금한 점을 입력해주세요"
-              style={{ width: '100%', height: '80px', padding: '10px', boxSizing: 'border-box', resize: 'none', marginBottom: '10px' }}
+              disabled={!canAskQuestion}
+              style={{ width: '100%', height: '80px', padding: '10px', boxSizing: 'border-box', resize: 'none', marginBottom: '10px', backgroundColor: canAskQuestion ? 'white' : '#f1f2f6' }}
             />
-            <button onClick={handleSubmitQuestion} style={{ width: '100%', padding: '10px', backgroundColor: '#28A745', color: 'white', border: 'none', cursor: 'pointer', borderRadius: '4px' }}>
+            <button 
+              onClick={handleSubmitQuestion} 
+              disabled={!canAskQuestion || !questionText.trim()}
+              style={{ 
+                width: '100%', padding: '10px', 
+                backgroundColor: canAskQuestion ? '#28A745' : '#b2bec3', 
+                color: 'white', border: 'none', 
+                cursor: canAskQuestion ? 'pointer' : 'not-allowed', 
+                borderRadius: '4px' 
+              }}
+            >
               등록하기
             </button>
           </div>
