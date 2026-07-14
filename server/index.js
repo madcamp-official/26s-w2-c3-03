@@ -75,6 +75,24 @@ app.use('/files', express.static(UPLOAD_DIR));
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Gemini 무료 티어는 분당 요청 수가 제한되어 있다(예: 15회). 슬라이드 수만큼 AI 호출을
+// Promise.all로 한꺼번에 쏘면 순간적으로 한도를 넘겨 429가 난다. 한 번에 limit개까지만
+// 동시에 실행하고, 하나가 끝나면 다음 것을 시작하는 방식으로 요청을 시간에 걸쳐 분산시킨다.
+async function mapWithConcurrencyLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await fn(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 async function callAiApiWithRetry(prompt, options = {}) {
   const {
     isJsonExpected = false, 
@@ -142,9 +160,14 @@ async function callAiApiWithRetry(prompt, options = {}) {
       if (attempt > maxRetries) {
         throw new Error(`AI 처리 최종 실패 (총 ${attempt}회 시도): ${error.message}`);
       }
-      
-      const waitTime = Math.pow(2, attempt - 1) * 1000;
-      console.log(`일시적 오류 발생. ${waitTime}ms 후 재시도합니다...`);
+
+      // 429(속도 제한)면 Gemini가 응답에 직접 실어 보내주는 권장 대기 시간(retryDelay)을
+      // 우선 사용한다. 못 찾으면(다른 종류의 일시적 오류) 기존 지수 백오프로 대체한다.
+      const retryInfo = error.errorDetails?.find(d => d['@type']?.includes('RetryInfo'));
+      const suggestedMs = retryInfo?.retryDelay ? parseFloat(retryInfo.retryDelay) * 1000 : null;
+      const waitTime = suggestedMs || Math.pow(2, attempt - 1) * 1000;
+
+      console.log(`일시적 오류 발생(${error.status === 429 ? '속도 제한 429' : error.message}). ${waitTime}ms 후 재시도합니다...`);
       await delay(waitTime);
     }
   }
@@ -489,24 +512,67 @@ app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
 
     const updateStmt = db.prepare('UPDATE slides SET ai_summary_note = ? WHERE slide_id = ?');
 
-    const aiPromises = slides.map(async (slide) => {
+    // [수정] 슬라이드마다 Promise.all로 전부 동시에 호출하면 Gemini 무료 티어의 분당 요청
+    // 한도(15회)를 순식간에 넘겨 429가 났다. 한 번에 AI_CONCURRENCY_LIMIT개씩만 동시 처리해
+    // 요청을 시간에 걸쳐 분산시킨다.
+    const AI_CONCURRENCY_LIMIT = 3;
+    const resolvedAiNotes = await mapWithConcurrencyLimit(slides, AI_CONCURRENCY_LIMIT, async (slide) => {
       let prompt = '';
       
       if (hasScript) {
-        prompt = `당신은 발표를 돕는 최고의 어시스턴트입니다. 다음 발표 대본을 발표자가 한눈에 보기 쉽게 '핵심 키워드 위주의 개조식(Bullet points)'으로 요약해 주세요. 너무 길지 않게 3~4줄로 부탁합니다.\n\n[원본 대본]\n${slide.original_note}`;
+        // [수정] 예전 프롬프트는 "핵심 키워드 위주로 요약해줘" 한 줄뿐이라, 결과가 매번 문장체로
+        // 나오거나 순서가 뒤섞이는 등 품질이 들쭉날쭉했다. 규칙과 출력 형식을 구체적으로
+        // 명시해서 "발표 중 흘끗 보고 말할 수 있는 짧은 키워드 개조식"이 나오도록 강제한다.
+        prompt = `당신은 발표자가 무대 위에서 슬라이드를 보며 참고할 "발표자 노트"를 만들어주는 전문 어시스턴트입니다.
+
+        아래는 이 슬라이드에 해당하는 원본 발표 대본입니다. 발표자가 대본을 토씨 하나 안 틀리고 읽는 게 아니라, 이 노트를 한눈에 훑어보고 자연스럽게 말할 수 있도록 핵심만 뽑아 정리해야 합니다.
+
+        규칙:
+        - 대본 내용을 그대로 옮기지 말고, 핵심 키워드/짧은 구(句) 단위로 압축하세요. 완전한 문장으로 쓰지 마세요.
+        - 대본에 나온 순서(말하는 흐름)를 그대로 유지하세요. 순서를 재배치하거나 임의로 재구성하지 마세요.
+        - 3~5개의 불릿 포인트로 작성하고, 각 불릿은 2~10단어 이내로 짧게 쓰세요.
+        - 숫자, 고유명사, 전문 용어는 원문 그대로 유지하세요 (임의로 바꾸거나 순화하지 마세요).
+        - 대본에 없는 내용을 추측해서 추가하지 마세요.
+        - 대본 내용이 비어있거나 너무 짧아 요약할 내용이 없으면 "(이 슬라이드에 대한 대본 없음)"이라고만 답하세요.
+
+        출력 형식:
+        - 각 줄은 "- "로 시작하는 불릿 하나만 포함하세요.
+        - 불릿 목록 외에 다른 설명, 인사말, 제목, 마크다운 헤더는 절대 포함하지 마세요.
+
+        [원본 대본]
+        ${slide.original_note}`;
       } else {
-        prompt = `당신은 발표를 돕는 최고의 어시스턴트입니다. 첨부된 PDF는 총 ${slides.length}장짜리 발표 자료입니다.
-        그 중 ${slide.slide_index}번째 페이지(슬라이드)의 내용만 근거로 삼아, 그 슬라이드를 설명하는 자연스러운 발표용 스크립트(대본)를 3~4문장으로 작성해 주세요.
-        다른 페이지의 내용을 섞지 말고, 반드시 ${slide.slide_index}번째 페이지 내용에만 집중해 주세요.`; 
+        // [수정] 예전 프롬프트는 "자연스러운 스크립트를 써줘"만 있어서, 슬라이드 문구를 그대로
+        // 읽는 듯한 딱딱한 문장이 나오거나 표지/목차 슬라이드에서도 본문처럼 서술하는 문제가 있었다.
+        // 슬라이드 유형별 톤, 환각 방지, 구어체 지시를 추가했다.
+        prompt = `당신은 발표자가 무대 위에서 참고할 "발표자 노트"를 만들어주는 전문 어시스턴트입니다.
+
+        첨부된 PDF는 총 ${slides.length}장짜리 발표 자료이며, 지금은 그 중 ${slide.slide_index}번째 페이지만 다룹니다.
+
+        임무: ${slide.slide_index}번째 페이지에 실제로 보이는 제목, 텍스트, 도표, 이미지 등을 근거로, 발표자가 그 페이지를 설명할 때 자연스럽게 말할 법한 발표 스크립트를 작성하세요.
+
+        규칙:
+        - 반드시 ${slide.slide_index}번째 페이지의 내용에만 집중하세요. 다른 페이지 내용을 섞거나 앞뒤 페이지를 추측해서 연결하지 마세요.
+        - 슬라이드에 적힌 문구를 그대로 읽지 말고, 실제 발표자가 청중에게 말하듯 자연스러운 구어체 문장으로 풀어서 설명하세요.
+        - 슬라이드에 없는 수치나 사실을 지어내지 마세요. 슬라이드에 나온 내용만 근거로 삼으세요.
+        - 3~4문장으로 간결하게 작성하세요.
+        - 이 페이지가 표지(제목 슬라이드)라면 인사와 발표 주제 소개 위주로, 목차/agenda 페이지라면 앞으로 다룰 내용을 간단히 안내하는 톤으로 작성하세요.
+
+        출력 형식:
+        - 발표 스크립트 본문만 출력하세요. "네, 알겠습니다" 같은 응답 멘트, 제목, 마크다운 기호는 절대 포함하지 마세요.`;
       }
 
       // 새로 만든 헬퍼 함수 활용 (텍스트 기대)
       // [수정] pdfBase64를 안 넘기고 있어서, 프롬프트는 "첨부된 PDF의 N번째 페이지를 보라"고
       // 써놓고 실제로는 아무 파일도 첨부하지 않은 채 호출되고 있었음. 대본이 없을 때만 필요하므로
       // hasScript일 땐 null을 넘겨서 불필요하게 PDF를 매 슬라이드마다 재전송하지 않게 함.
+      // [수정] 슬라이드 수가 많으면 분당 요청 한도(15회)에 걸려 2~3번의 재시도 주기를
+      // 거쳐야 통과되는 경우가 있어, 기본값(2회)보다 넉넉하게 잡는다. 실제 대기 시간은
+      // 위에서 Gemini가 알려주는 retryDelay를 그대로 쓰므로 무의미하게 길어지진 않는다.
       const aiSummary = await callAiApiWithRetry(prompt, {
         isJsonExpected: false,
-        pdfBase64: hasScript ? null : pdfBase64
+        pdfBase64: hasScript ? null : pdfBase64,
+        maxRetries: 5
       });
       
       updateStmt.run(aiSummary, slide.slide_id);
@@ -514,7 +580,6 @@ app.post('/rooms/:roomId/slides/note/ai', async (req, res) => {
       return { slideIndex: slide.slide_index, text: aiSummary, imageUrl: slide.image_url || null };
     });
 
-    const resolvedAiNotes = await Promise.all(aiPromises);
     resolvedAiNotes.sort((a, b) => a.slideIndex - b.slideIndex);
 
     const source = hasScript ? 'ai_summarize' : 'ai_generate';
