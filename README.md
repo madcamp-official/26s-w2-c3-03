@@ -278,7 +278,7 @@ sequenceDiagram
 | GET | `/rooms/:roomId/history` | 발표 기록 상세 조회 | Header `Authorization` | `{ success, history: {...} }` | 슬라이드/노트/답변한 질문/발표자 목록 포함. "다시 발표하기"(`room:create_from_history`)의 원본 데이터로도 재사용 |
 | GET (static) | `/files/:filename` | 업로드 파일(발표자료 PDF, 슬라이드 PNG, 대본) 서빙 | - | 파일 바이너리 | `express.static(UPLOAD_DIR)` |
 | WebSocket | Socket.io 이벤트 전체 | 방 입장, 슬라이드 제어, 타이머, 질문 등 실시간 동기화 | — | — | 이벤트 목록·payload는 `shared/events.js` 및 위 [WebSocket 구조도](#실시간-인터랙션-websocketsocketio-구조도) 참고 |
-| REST (외부) | Google Gemini API — `generateContent` (`@google/generative-ai`, model `gemini-3.1-flash-lite`) | 대본→슬라이드 매칭, 발표자 노트 요약/생성 | 프롬프트 텍스트(+PDF Base64 첨부 가능), JSON 응답 시 `responseSchema`로 형식 강제 | 텍스트 또는 스키마 강제 JSON | 429(rate limit) 시 응답의 `retryDelay`만큼 대기 후 재시도, 응답이 깨지면 `jsonrepair`로 보정. 자세한 흐름은 위 [API 연동 흐름도](#llm-wrapper-api-연동-흐름도-gemini) 참고 |
+| REST (외부) | Google Gemini API — `generateContent` | 대본→슬라이드 매칭, 발표자 노트 요약/생성 | 프롬프트 텍스트(+PDF Base64 첨부 가능), JSON 응답 시 `responseSchema`로 형식 강제 | 텍스트 또는 스키마 강제 JSON | SDK `@google/generative-ai`, model `gemini-3.1-flash-lite`. 429(rate limit) 시 응답의 `retryDelay`만큼 대기 후 재시도, 응답이 깨지면 `jsonrepair`로 보정. 자세한 흐름은 위 [API 연동 흐름도](#llm-wrapper-api-연동-흐름도-gemini) 참고 |
 
 ---
 
