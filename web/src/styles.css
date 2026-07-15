@@ -16,6 +16,9 @@
   justify-content: center;
   padding: 24px;
   text-align: center;
+  /* [수정] 화면이 낮은 브라우저 창/기기에서 카드 아래 안내 문구(설명글)가 justify-content: center로
+     인해 화면 밖으로 밀려 잘려 보이던 문제 — 내용이 넘치면 스크롤해서 끝까지 볼 수 있게 함 */
+  overflow-y: auto;
 }
 
 /* ---------- 브랜드 헤더 ---------- */
@@ -162,6 +165,10 @@
   color: var(--ink-dim);
   font-size: 15px;
   line-height: 1.6;
+  /* [수정] 브라우저 기본 줄바꿈이 한글 단어 중간(예: "입력" / "해 주세요")에서 끊어버리는 문제 —
+     띄어쓰기 단위로만 줄바꿈되게 해서 단어가 안 잘리게 함 */
+  word-break: keep-all;
+  overflow-wrap: break-word;
 }
 
 .home-choices {

@@ -12,13 +12,17 @@ export const API_BASE = import.meta.env.DEV
 
 export const socket = io(API_BASE);
 
-// [신규] 재연결해도 같은 사람으로 인식되도록, 역할별로 고정 userId를 localStorage에 보관해두고
-// 매번 join/create 이벤트에 실어보낸다. (서버가 이 값을 신원으로 그대로 신뢰함 — events.js 참고)
+// [수정] localStorage는 같은 브라우저의 모든 탭이 공유하는 저장소라서, 청중 여러 명을 한 컴퓨터에서
+// 탭 여러 개로 테스트/입장시키면(실제로 흔한 상황) 전부 같은 userId를 받아버렸음. 그 결과 나중에
+// 입장한 탭이 서버 users 테이블의 socket_id 매핑을 덮어써서, 먼저 입장한 탭은 질문 등록(question:submit)
+// 시 서버가 "SELECT ... WHERE socket_id = ?"로 자신을 못 찾아 조용히 무시당함(버튼은 눌리는데
+// 아무 반응 없음). sessionStorage는 탭마다 독립적이라 이 충돌이 안 생기고, 새로고침 시 같은 사람으로
+// 인식되는 기존 동작(재연결 시 신원 유지)은 그대로 유지된다(탭을 닫기 전까지는 값이 살아있음).
 export const getOrCreateUserId = (storageKey) => {
-  let id = localStorage.getItem(storageKey);
+  let id = sessionStorage.getItem(storageKey);
   if (!id) {
     id = 'usr_' + Math.random().toString(36).substring(2, 10);
-    localStorage.setItem(storageKey, id);
+    sessionStorage.setItem(storageKey, id);
   }
   return id;
 };

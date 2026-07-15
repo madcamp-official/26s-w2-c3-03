@@ -261,24 +261,24 @@ sequenceDiagram
 
 ### API / 외부 서비스 연동
 
-| Method / 방식 | Endpoint / 서비스 | 설명 | 요청 | 응답 | 비고 |
-|---|---|---|---|---|---|
-| POST | `/auth/signup` | 회원가입 | `{ email, password, name }` | `{ success, token, accountId, name }` | 비밀번호는 영문+숫자+특수문자 8~12자 정규식 검증, bcrypt 해시 저장 |
-| POST | `/auth/login` | 로그인 | `{ email, password }` | `{ success, token, accountId, name }` | JWT 30일 만료 |
-| GET | `/auth/me` | 로그인 토큰 유효성 확인 | Header `Authorization: Bearer <token>` | `{ success, accountId, name }` | 새로고침 시 로그인 상태 복구용 |
-| POST | `/rooms/:roomId/presentation` | 발표 자료(PDF) 업로드 → 슬라이드 이미지 변환 | multipart `presentationFile`(PDF), `ownerId` | `{ success, slideCount, fileUrl, images[] }` | `pdf-to-png-converter`로 페이지별 PNG 생성 + DB 저장, 완료 시 소켓 `file:ready` 브로드캐스트 |
-| POST | `/rooms/:roomId/script` | 대본 업로드 → AI가 슬라이드별로 자동 분할 | multipart `scriptFile`(DOCX/TXT) | `{ success, slideCount, slideNotes[] }` | `mammoth`로 텍스트 추출 후 Gemini 호출(아래 외부 서비스 참고), 완료 시 `notes:ready` 브로드캐스트 |
-| POST | `/rooms/:roomId/slides/note/ai` | AI 발표자 노트 요약/생성 | (body 없음, `roomId`만 사용) | `{ success, slideNotes[] }` / 409(이미 생성됨) | 대본 있으면 요약, 없으면 PDF 기반 생성. 슬라이드당 Gemini 1회 호출(동시 3개로 제한), `rooms.ai_notes_generated`로 같은 대본 기준 중복 호출 차단 |
-| PUT | `/rooms/:roomId/slides/:slideIndex/note` | 발표자 노트 수동 수정 | `{ newNote, editedByName }` | `{ success }` | 같은 방의 다른 발표자에게 `note:saved` 브로드캐스트 |
-| GET | `/rooms/:roomId` | 방 현재 상태 조회 | - | `{ success, room: {...} }` | 재연결·늦은 입장 시 소켓 이벤트를 놓쳤을 때 상태 복구용. 접속 코드(presenter/display/audience code)는 내려주지 않음 |
-| GET | `/rooms/:roomId/slides` | 슬라이드 + 노트 목록 조회 | - | `{ success, slides[] }` | 노트 수정 화면 등 늦게 입장한 클라이언트의 초기 로딩용 |
-| GET | `/rooms/:roomId/questions` | 질문 목록 조회 | - | `{ success, questions[] }` | 완료된 질문은 `completed_at`, 나머지는 `created_at` 기준 정렬 |
-| GET | `/accounts/me/rooms` | 로그인 계정의 이전 발표 기록 목록 | Header `Authorization` | `{ success, rooms[] }` | 방장뿐 아니라 참여 발표자로 들어갔던 방도 포함, 계정이 숨긴 기록은 제외 |
-| DELETE | `/rooms/:roomId/history` | 발표 기록 삭제 | Header `Authorization` | `{ success }` | 실제 방/자료는 지우지 않고 요청 계정의 목록에서만 숨김 처리 |
-| GET | `/rooms/:roomId/history` | 발표 기록 상세 조회 | Header `Authorization` | `{ success, history: {...} }` | 슬라이드/노트/답변한 질문/발표자 목록 포함. "다시 발표하기"(`room:create_from_history`)의 원본 데이터로도 재사용 |
-| GET (static) | `/files/:filename` | 업로드 파일(발표자료 PDF, 슬라이드 PNG, 대본) 서빙 | - | 파일 바이너리 | `express.static(UPLOAD_DIR)` |
-| WebSocket | Socket.io 이벤트 전체 | 방 입장, 슬라이드 제어, 타이머, 질문 등 실시간 동기화 | — | — | 이벤트 목록·payload는 `shared/events.js` 및 위 [WebSocket 구조도](#실시간-인터랙션-websocketsocketio-구조도) 참고 |
-| REST (외부) | Google Gemini API — `generateContent` (`@google/generative-ai`, model `gemini-3.1-flash-lite`) | 대본→슬라이드 매칭, 발표자 노트 요약/생성 | 프롬프트 텍스트(+PDF Base64 첨부 가능), JSON 응답 시 `responseSchema`로 형식 강제 | 텍스트 또는 스키마 강제 JSON | 429(rate limit) 시 응답의 `retryDelay`만큼 대기 후 재시도, 응답이 깨지면 `jsonrepair`로 보정. 자세한 흐름은 위 [API 연동 흐름도](#llm-wrapper-api-연동-흐름도-gemini) 참고 |
+| Method / 방식 | Endpoint / 서비스 | 설명 | 요청 | 응답 |
+|---|---|---|---|---|
+| POST | `/auth/signup` | 회원가입. 비밀번호는 영문+숫자+특수문자 8~12자 정규식 검증, bcrypt 해시 저장 | `{ email, password, name }` | `{ success, token, accountId, name }` |
+| POST | `/auth/login` | 로그인. JWT 30일 만료 | `{ email, password }` | `{ success, token, accountId, name }` |
+| GET | `/auth/me` | 로그인 토큰 유효성 확인. 새로고침 시 로그인 상태 복구용 | Header `Authorization: Bearer <token>` | `{ success, accountId, name }` |
+| POST | `/rooms/:roomId/presentation` | 발표 자료(PDF) 업로드 → 슬라이드 이미지 변환. `pdf-to-png-converter`로 페이지별 PNG 생성 + DB 저장, 완료 시 소켓 `file:ready` 브로드캐스트 | multipart `presentationFile`(PDF), `ownerId` | `{ success, slideCount, fileUrl, images[] }` |
+| POST | `/rooms/:roomId/script` | 대본 업로드 → AI가 슬라이드별로 자동 분할. `mammoth`로 텍스트 추출 후 Gemini 호출(아래 외부 서비스 참고), 완료 시 `notes:ready` 브로드캐스트 | multipart `scriptFile`(DOCX/TXT) | `{ success, slideCount, slideNotes[] }` |
+| POST | `/rooms/:roomId/slides/note/ai` | AI 발표자 노트 요약/생성. 대본 있으면 요약, 없으면 PDF 기반 생성. 슬라이드당 Gemini 1회 호출(동시 3개로 제한), `rooms.ai_notes_generated`로 같은 대본 기준 중복 호출 차단 | (body 없음, `roomId`만 사용) | `{ success, slideNotes[] }` / 409(이미 생성됨) |
+| PUT | `/rooms/:roomId/slides/:slideIndex/note` | 발표자 노트 수동 수정. 같은 방의 다른 발표자에게 `note:saved` 브로드캐스트 | `{ newNote, editedByName }` | `{ success }` |
+| GET | `/rooms/:roomId` | 방 현재 상태 조회. 재연결·늦은 입장 시 소켓 이벤트를 놓쳤을 때 상태 복구용. 접속 코드(presenter/display/audience code)는 내려주지 않음 | - | `{ success, room: {...} }` |
+| GET | `/rooms/:roomId/slides` | 슬라이드 + 노트 목록 조회. 노트 수정 화면 등 늦게 입장한 클라이언트의 초기 로딩용 | - | `{ success, slides[] }` |
+| GET | `/rooms/:roomId/questions` | 질문 목록 조회. 완료된 질문은 `completed_at`, 나머지는 `created_at` 기준 정렬 | - | `{ success, questions[] }` |
+| GET | `/accounts/me/rooms` | 로그인 계정의 이전 발표 기록 목록. 방장뿐 아니라 참여 발표자로 들어갔던 방도 포함, 계정이 숨긴 기록은 제외 | Header `Authorization` | `{ success, rooms[] }` |
+| DELETE | `/rooms/:roomId/history` | 발표 기록 삭제. 실제 방/자료는 지우지 않고 요청 계정의 목록에서만 숨김 처리 | Header `Authorization` | `{ success }` |
+| GET | `/rooms/:roomId/history` | 발표 기록 상세 조회. 슬라이드/노트/답변한 질문/발표자 목록 포함. "다시 발표하기"(`room:create_from_history`)의 원본 데이터로도 재사용 | Header `Authorization` | `{ success, history: {...} }` |
+| GET (static) | `/files/:filename` | 업로드 파일(발표자료 PDF, 슬라이드 PNG, 대본) 서빙. `express.static(UPLOAD_DIR)` | - | 파일 바이너리 |
+| WebSocket | Socket.io 이벤트 전체 | 방 입장, 슬라이드 제어, 타이머, 질문 등 실시간 동기화. 이벤트 목록·payload는 `shared/events.js` 및 위 [WebSocket 구조도](#실시간-인터랙션-websocketsocketio-구조도) 참고 | — | — |
+| REST (외부) | Google Gemini API — `generateContent` (`@google/generative-ai`, model `gemini-3.1-flash-lite`) | 대본→슬라이드 매칭, 발표자 노트 요약/생성. 429(rate limit) 시 응답의 `retryDelay`만큼 대기 후 재시도, 응답이 깨지면 `jsonrepair`로 보정. 자세한 흐름은 위 [API 연동 흐름도](#llm-wrapper-api-연동-흐름도-gemini) 참고 | 프롬프트 텍스트(+PDF Base64 첨부 가능), JSON 응답 시 `responseSchema`로 형식 강제 | 텍스트 또는 스키마 강제 JSON |
 
 ---
 

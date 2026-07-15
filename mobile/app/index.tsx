@@ -1,6 +1,6 @@
 // mobile/app/index.tsx
 import { useState, useCallback, useEffect } from 'react';
-import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Alert, Image } from 'react-native';
+import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Alert, Image, KeyboardAvoidingView, Platform } from 'react-native';
 import { router } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 import Ionicons from '@expo/vector-icons/Ionicons';
@@ -159,7 +159,14 @@ export default function StartScreen() {
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    // [수정] "코드로 참가하기" 입력창이 화면 아래쪽에 있어서, 키보드가 올라오면 그 위를 덮어버려
+    // 입력 중인 코드가 안 보이던 문제 — 포커스된 입력창 위로 화면이 밀려 올라가게 함
+    <KeyboardAvoidingView
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 24}
+    >
+    <ScrollView style={styles.container} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       {/* 브랜드 마크 + 로그인 상태 */}
       <View style={styles.brandRow}>
         <View style={styles.brandBadge}>
@@ -261,6 +268,7 @@ export default function StartScreen() {
         ))
       )}
     </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 

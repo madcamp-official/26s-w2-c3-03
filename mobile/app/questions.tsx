@@ -80,11 +80,12 @@ function SlideNav() {
   const slideCount = useKitStore((s) => s.slideCount);
   const imageUrl = useKitStore((s) => s.slideImages[s.currentSlideIndex]);
 
-  // 슬라이드 제어권이 없는(현재 발표자가 아닌) 사람에게는 굳이 안 보여줌 — 눌러도 서버가 무시함
-  if (!isCurrentPresenter) return null;
-
-  const prevDisabled = currentSlideIndex <= 1;
-  const nextDisabled = slideCount > 0 && currentSlideIndex >= slideCount;
+  // [수정] 예전엔 슬라이드 제어권 없는 사람에게 이 카드 자체를 안 보여줬는데, 그러면 "질문에 답하면서
+  // 슬라이드도 넘길 수 있다"는 걸 아무도 미리 알 수 없었음. 이제 전원에게 보여주되, 제어권이 없으면
+  // 이전/다음 버튼만 비활성화해서 "지금은 못 넘기지만 이런 기능이 있다"는 걸 알 수 있게 함.
+  // 질문에 "답변하기"를 누르면 서버가 제어권을 그 사람에게 넘겨주면서 버튼이 자동으로 켜진다.
+  const prevDisabled = !isCurrentPresenter || currentSlideIndex <= 1;
+  const nextDisabled = !isCurrentPresenter || (slideCount > 0 && currentSlideIndex >= slideCount);
 
   return (
     <View style={styles.slideNavCard}>
@@ -102,7 +103,9 @@ function SlideNav() {
       </View>
       <View style={styles.slideNavRight}>
         <Text style={styles.slideNavIdx}>SLIDE {currentSlideIndex} / {slideCount || '-'}</Text>
-        <Text style={styles.slideNavHint}>PC·청중 화면에 그대로 반영돼요</Text>
+        <Text style={styles.slideNavHint}>
+          {isCurrentPresenter ? 'PC·청중 화면에 그대로 반영돼요' : '질문에 답변하면 슬라이드 제어권을 받아요'}
+        </Text>
         <View style={styles.slideNavBtnRow}>
           <Pressable
             style={[styles.slideNavBtn, prevDisabled && styles.disabled]}

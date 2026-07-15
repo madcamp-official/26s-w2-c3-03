@@ -46,8 +46,6 @@ export default function Home() {
               </div>
             </Link>
           </div>
-
-          <Link to="/dev" className="dev-link">개발자 테스트 도구 →</Link>
         </div>
       </div>
     </div>

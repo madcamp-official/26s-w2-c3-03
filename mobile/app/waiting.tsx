@@ -170,6 +170,7 @@ function ScriptUploadButton() {
   const deckUploaded = useKitStore((s) => s.deckUploaded);
   const scriptProcessing = useKitStore((s) => s.scriptProcessing);
   const slideNotes = useKitStore((s) => s.slideNotes);
+  const hasScript = useKitStore((s) => s.hasScript);
   const roomId = useKitStore((s) => s.roomId);
 
   const handlePick = async () => {
@@ -224,19 +225,23 @@ function ScriptUploadButton() {
     }
   };
 
+  // [수정] slideNotes는 대본 업로드뿐 아니라 "대본 없이 AI 노트 생성하기"로도 채워지는 공용 상태라,
+  // slideNotes.length > 0 만으로 판단하면 대본을 올린 적 없는데도 "대본 업로드 완료"라고 떠서
+  // 대본을 올렸다고 착각하게 만드는 문제가 있었음. 실제로 대본을 올렸는지(hasScript)를 같이 확인.
+  const scriptDone = hasScript && slideNotes.length > 0;
   const label = uploading
     ? '전송 중...'
     : scriptProcessing
     ? 'AI가 슬라이드별로 정리 중...'
-    : slideNotes.length > 0
+    : scriptDone
     ? `대본 업로드 완료 · ${slideNotes.length}개 노트 생성됨`
     : '대본 업로드';
 
   return (
     <Pressable style={[styles.uploadRow, !deckUploaded && styles.disabled]} onPress={handlePick}>
-      <View style={[styles.uploadIcon, slideNotes.length > 0 && styles.uploadIconDone]}>
-        <Text style={{ color: slideNotes.length > 0 ? colors.cue : colors.inkDim }}>
-          {scriptProcessing ? '…' : slideNotes.length > 0 ? '✓' : '↑'}
+      <View style={[styles.uploadIcon, scriptDone && styles.uploadIconDone]}>
+        <Text style={{ color: scriptDone ? colors.cue : colors.inkDim }}>
+          {scriptProcessing ? '…' : scriptDone ? '✓' : '↑'}
         </Text>
       </View>
       <View style={{ flex: 1 }}>

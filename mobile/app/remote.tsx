@@ -371,7 +371,8 @@ const styles = StyleSheet.create({
   },
   notesLabel: { fontSize: 10.5, letterSpacing: 1, textTransform: 'uppercase', color: colors.inkFaint, marginBottom: 8 },
   notesScroll: { flex: 1 },
-  notesText: { fontSize: 14, lineHeight: 21, color: colors.ink },
+  // [수정] 발표하면서 흘깃 보기엔 14px가 너무 작다는 피드백 — 눈에 바로 들어오도록 크게 키움
+  notesText: { fontSize: 19, lineHeight: 28, fontWeight: '600', color: colors.ink },
 
   bottomRow: { flexDirection: 'row', gap: 10, paddingHorizontal: 20, paddingVertical: 16 },
   ghostButton: {

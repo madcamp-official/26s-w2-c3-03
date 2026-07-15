@@ -1038,7 +1038,9 @@ io.on('connection', (socket) => {
       title: room.title,
       displayCode: room.display_code,
       presenterCode: room.presenter_code,
-      audienceCode: null,
+      // [수정] 방장이 아닌 다른 발표자가 코드로 참가할 때 청중 코드가 항상 null로 내려가서
+      // 대기 화면에 "-"로만 보이던 문제 — 방 생성자와 동일하게 실제 값을 내려줌
+      audienceCode: room.audience_code,
       currentFileUrl: room.file_url || null,
       slideCount,
       hasScript: !!room.has_script,
@@ -1357,10 +1359,20 @@ io.on('connection', (socket) => {
     db.prepare("UPDATE questions SET status = 'answering', selected_at = ?, answering_presenter_id = ? WHERE question_id = ?")
       .run(Date.now(), user.user_id, questionId);
 
+    // [수정] 발표 종료 후 질문 답변 시, 답변하는 사람에게 슬라이드 제어권(current_presenter_id)도
+    // 같이 넘겨준다. 예전엔 발표 마지막 순간의 발표자만 계속 슬라이드를 넘길 수 있어서, 다른
+    // 발표자가 질문에 답하면서 관련 슬라이드로 넘기고 싶어도 못 넘겼음. PRESENTER_TRANSFER와
+    // 동일한 방식(현재 발표자 UPDATE + 목록 재브로드캐스트)으로 처리 — 이미 본인이 제어권을
+    // 갖고 있어도(마지막 발표자 본인이 답변하는 경우) 그대로 자기 자신으로 갱신되니 무해하다.
+    const room = db.prepare('SELECT file_url FROM rooms WHERE room_id = ?').get(user.room_id);
+    db.prepare('UPDATE rooms SET current_presenter_id = ? WHERE room_id = ?').run(user.user_id, user.room_id);
+    io.to(user.room_id).emit(EVENTS.PRESENTER_CHANGED, { newPresenterId: user.user_id, fileUrl: room?.file_url });
+    broadcastPresenterList(user.room_id);
+
     io.to(user.room_id).emit(EVENTS.QUESTION_ANSWERING_STARTED, {
       questionId: String(questionId),
-      text: q.content, 
-      nickname: q.author_name, 
+      text: q.content,
+      nickname: q.author_name,
       answeringPresenterId: user.user_id,
       answeringPresenterName: user.name || '발표자'
     });
@@ -1385,7 +1397,6 @@ io.on('connection', (socket) => {
       ...row,
       questionId: String(row.questionId)
     }));
-
     io.to(user.room_id).emit(EVENTS.ANSWERED_QUESTIONS_UPDATE, { answered: formattedAnswered });
   });
 
