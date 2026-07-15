@@ -1,0 +1,9 @@
+{
+  "ignore": [
+    "kit.db",
+    "kit.db-journal",
+    "kit.db-wal",
+    "kit.db-shm",
+    "uploads/*"
+  ]
+}

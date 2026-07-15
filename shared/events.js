@@ -165,9 +165,8 @@ const EVENTS = {
 
   PRESENTER_TRANSFER: 'presenter:transfer',
   // payload: { targetUserId: string }
-
   PRESENTER_CHANGED: 'presenter:changed',
-  // payload: { newPresenterId: string, fileUrl: string }
+  // payload: { newPresenterId: string }
 
 
   // ══════════════════════════════════════════════

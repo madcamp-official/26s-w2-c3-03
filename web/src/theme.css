@@ -1,0 +1,62 @@
+/* web/src/theme.css
+   mobile/constants/theme.ts와 동일한 팔레트를 써서 앱-웹 간 톤을 맞춘다. */
+:root {
+  --canvas: #ECEEF3;
+  --surface: #FFFFFF;
+  --surface-raised: #EEF1F6;
+  --hairline: #E2E5EC;
+  --ink: #171A21;
+  --ink-dim: #6B7180;
+  --ink-faint: #868C9C;
+  --spot: #2F5FE0;
+  --spot-ink: #FFFFFF;
+  --cue: #0E8A7D;
+  --alert: #D6393F;
+  --alert-ink: #FFFFFF;
+
+  --radius-lg: 28px;
+  --radius-md: 16px;
+  --radius-sm: 10px;
+
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Pretendard, Roboto, sans-serif;
+
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  min-height: 100svh;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--canvas);
+  color: var(--ink);
+  letter-spacing: -0.1px;
+}
+
+h1, h2, h3, h4 {
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+}
+
+p {
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+}
+
+input, textarea, select {
+  font-family: inherit;
+}
