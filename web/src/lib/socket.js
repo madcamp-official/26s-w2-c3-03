@@ -3,7 +3,12 @@
 // 서버(shared/events.js) 프로토콜과의 계약은 동일하게 유지한다.
 import { io } from 'socket.io-client';
 
-export const API_BASE = `http://${window.location.hostname}:4000`;
+// [수정] 로컬 개발(vite dev) 중엔 지금처럼 접속한 호스트의 4000번 포트(로컬 서버)를 그대로 쓰고,
+// 빌드된 프로덕션 번들(vite build)에서는 Railway에 배포된 공개 서버로 고정한다.
+// (Vercel/Netlify 등에 web을 올렸을 때도 항상 이 주소로 API를 호출하게 됨)
+export const API_BASE = import.meta.env.DEV
+  ? `http://${window.location.hostname}:4000`
+  : 'https://kit-production-1af1.up.railway.app';
 
 export const socket = io(API_BASE);
 
